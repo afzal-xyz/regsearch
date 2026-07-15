@@ -1,7 +1,21 @@
 [project]
 name = "regsearch"
 version = "0.1.0"
-description = "Add your description here"
+description = "Hybrid RAG search over the US Code of Federal Regulations (eCFR)"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "requests>=2.34.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "truststore>=0.10.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: hits the network / is slow (deselect with -m 'not slow')",
+]
