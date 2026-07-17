@@ -27,6 +27,10 @@ htmlcov/
 data/raw/*
 !data/raw/.gitkeep
 
+# Derived chunk output
+data/chunks/*
+!data/chunks/.gitkeep
+
 # IDE / OS
 .idea/
 .vscode/
