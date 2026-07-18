@@ -31,6 +31,10 @@ data/raw/*
 data/chunks/*
 !data/chunks/.gitkeep
 
+# Built index (SQLite db + vectors + BM25)
+data/index/*
+!data/index/.gitkeep
+
 # IDE / OS
 .idea/
 .vscode/
