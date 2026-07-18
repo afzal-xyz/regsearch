@@ -35,7 +35,8 @@ RRF_K = 60  # reciprocal rank fusion constant
 @dataclass
 class SearchResult:
     chunk_id: str
-    citation: str
+    citation: str  # chunk citation, may include a paragraph anchor
+    section_citation: str  # section-level citation (the eval hit key)
     score: float
     retrievers: list[str]  # subset of {"vector", "bm25"} that surfaced this chunk
     heading: str
@@ -54,6 +55,7 @@ def _result(
     return SearchResult(
         chunk_id=chunk_id,
         citation=row["citation"],
+        section_citation=row["section_citation"],
         score=float(score),
         retrievers=retrievers,
         heading=row["heading"],

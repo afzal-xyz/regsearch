@@ -35,6 +35,10 @@ data/chunks/*
 data/index/*
 !data/index/.gitkeep
 
+# Eval run outputs (gold.jsonl IS tracked; results are not)
+eval/results/*
+!eval/results/.gitkeep
+
 # IDE / OS
 .idea/
 .vscode/
