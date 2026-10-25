@@ -5,7 +5,25 @@ score, and which retrievers hit):
 
 - :func:`vector_search` — semantic KNN via sqlite-vec.
 - :func:`bm25_search`   — lexical BM25 via rank-bm25.
-- :func:`hybrid_search` — both, fused with Reciprocal Rank Fusion (k = 60).
+- :func:`hybrid_search` — both, fused with Reciprocal Rank Fusion.
+
+Hybrid fusion has three properties that plain RRF over chunks does not. Each
+was measured against ``eval/gold.jsonl``; see "Hybrid fusion" in the README.
+
+1. **Fusion happens over sections, not chunks.** A section split into several
+   chunks used to occupy several RRF slots and crowd out whole other sections.
+   Each retriever's ranking is collapsed to its best chunk per section first,
+   so a section's rank means the same thing on both sides of the fusion.
+
+2. **BM25 is weighted by its confidence on this query** (see
+   :func:`bm25_confidence`). BM25 scores every query against *something*, so on
+   a question phrased in everyday words it returns a confident-looking but
+   arbitrary ranking. Fusing that at full strength drags good semantic hits
+   down. The weight scales with how sharply BM25's top hit stands out.
+
+3. **A small ``rrf_k``.** The classic k = 60 flattens ranks 1..50 into a
+   narrow score band, so the distinction between "best hit" and "50th hit"
+   nearly vanishes and co-occurrence in two pools outweighs it.
 
 CLI:
     python -m retrieval.search "when must a GAO employee file a financial disclosure" --k 5
@@ -26,10 +44,29 @@ import sqlite_vec
 from index import store
 from index.embedder import DEFAULT_MODEL, Embedder
 from index.store import DEFAULT_DB, connect, load_bm25, tokenize
+from index.tokenizer import citation_tokens
 
 logger = logging.getLogger(__name__)
 
-RRF_K = 60  # reciprocal rank fusion constant
+RRF_K = 10  # reciprocal rank fusion constant
+
+# Candidate sections pulled from each retriever before fusion.
+POOL = 50
+# Chunks fetched per candidate section, so `POOL` distinct sections survive de-duping.
+_POOL_OVERFETCH = 3
+
+BM25_WEIGHT = 1.0  # weight of a fully-confident BM25 ranking (vector is always 1.0)
+
+# BM25 confidence is measured as "contrast": the top score over the score at
+# rank BM25_CONTRAST_ANCHOR. Below _LO the ranking is treated as noise and
+# ignored; above _HI it is trusted fully; in between the weight ramps linearly.
+#
+# These are calibrated against the analyzer in index.tokenizer: changing how
+# text is tokenized moves the score distribution, so re-tune them (and bump
+# ANALYZER_VERSION) alongside any analyzer change.
+BM25_CONTRAST_ANCHOR = 20
+BM25_CONTRAST_LO = 1.5
+BM25_CONTRAST_HI = 1.9
 
 
 @dataclass
@@ -101,6 +138,60 @@ def bm25_search(query: str, k: int = 5, *, conn: sqlite3.Connection) -> list[Sea
     return [_result(conn, ids[i], scores[i], ["bm25"]) for i in order if scores[i] > 0]
 
 
+def bm25_confidence(
+    scores: list[float],
+    *,
+    anchor: int = BM25_CONTRAST_ANCHOR,
+    lo: float = BM25_CONTRAST_LO,
+    hi: float = BM25_CONTRAST_HI,
+) -> float:
+    """How much to trust a BM25 ranking, in [0, 1], from its score distribution.
+
+    BM25 ranks every query against *something*: ask "can I bring a gun into the
+    GAO building?" and it will happily return 50 chunks, none of which contain
+    "gun" (the regulation says "firearms"). The tell is not the absolute score
+    but the *contrast* — a real lexical match towers over the rest of the list,
+    while noise comes back nearly flat.
+
+    Contrast is the top score divided by the score at rank ``anchor``, which is
+    scale-free: it does not move with query length or corpus size. It ramps
+    linearly from 0 at ``lo`` to 1 at ``hi``. The ramp matters — a hard
+    threshold scores the same recall but a visibly worse MRR, because queries
+    land either side of the cutoff by a hair.
+    """
+    if not scores or scores[0] <= 0:
+        return 0.0
+    if len(scores) < anchor:
+        # Fewer than `anchor` chunks share any term with the query at all, so
+        # the query is highly discriminative — exactly when BM25 is worth most.
+        return 1.0
+    reference = scores[anchor - 1]
+    if reference <= 0:
+        return 1.0
+    contrast = scores[0] / reference
+    if contrast <= lo:
+        return 0.0
+    if contrast >= hi:
+        return 1.0
+    return (contrast - lo) / (hi - lo)
+
+
+def _best_per_section(results: list[SearchResult]) -> list[SearchResult]:
+    """Collapse a ranked chunk list to its best chunk per section, order kept.
+
+    The list is already best-first, so the first chunk seen for a section is
+    that section's best match.
+    """
+    seen: set[str] = set()
+    collapsed = []
+    for r in results:
+        if r.section_citation in seen:
+            continue
+        seen.add(r.section_citation)
+        collapsed.append(r)
+    return collapsed
+
+
 def hybrid_search(
     query: str,
     k: int = 5,
@@ -108,25 +199,67 @@ def hybrid_search(
     conn: sqlite3.Connection,
     embedder: Embedder,
     rrf_k: int = RRF_K,
+    pool: int = POOL,
+    bm25_weight: float = BM25_WEIGHT,
 ) -> list[SearchResult]:
-    """Fuse vector + BM25 rankings with Reciprocal Rank Fusion.
+    """Fuse vector + BM25 rankings with confidence-weighted, section-level RRF.
 
-    RRF score for a chunk = sum over retrievers of 1 / (rrf_k + rank), with
-    1-based ranks. Pulls a pool of ``max(k, 50)`` from each retriever first.
+    Each retriever contributes ``weight / (rrf_k + rank)`` per section, with
+    1-based ranks over its ``pool`` best *sections*. Vector always has weight
+    1.0; BM25 has ``bm25_weight`` scaled by :func:`bm25_confidence`, so a BM25
+    ranking that looks like noise is damped or ignored entirely and hybrid
+    falls back to pure semantic order — unless the query names a section, in
+    which case BM25 has a verified lexical anchor and is trusted outright.
+
+    Returns up to ``k`` results, one per section — the section's best-matching
+    chunk, carrying the fused score.
     """
-    pool = max(k, 50)
-    vector_hits = vector_search(query, pool, conn=conn, embedder=embedder)
-    bm25_hits = bm25_search(query, pool, conn=conn)
+    chunk_pool = pool * _POOL_OVERFETCH
+    vector_hits = _best_per_section(vector_search(query, chunk_pool, conn=conn, embedder=embedder))
+    bm25_chunks = bm25_search(query, chunk_pool, conn=conn)
+
+    wanted = citation_tokens(query)
+    if wanted:
+        # bm25_confidence infers "did BM25 find a real lexical anchor" from the
+        # shape of its scores, because normally there is nothing better to go
+        # on. A query that names a section gives us that answer directly, and
+        # a citation is the most discriminating term there is — so do not let
+        # the heuristic veto it. Without this, a question citing a section
+        # whose score curve happens to look flat loses BM25 entirely, which is
+        # exactly the ranking that knows where that section is referenced.
+        confidence = 1.0
+    else:
+        # Read off the raw chunk scores, before section de-duping.
+        confidence = bm25_confidence([r.score for r in bm25_chunks])
+    bm25_scaled = bm25_weight * confidence
+    bm25_hits = _best_per_section(bm25_chunks)
 
     fused: dict[str, float] = {}
+    best_chunk: dict[str, str] = {}
     retrievers: dict[str, set[str]] = {}
-    for ranked in (vector_hits, bm25_hits):
-        for rank, res in enumerate(ranked, start=1):
-            fused[res.chunk_id] = fused.get(res.chunk_id, 0.0) + 1.0 / (rrf_k + rank)
-            retrievers.setdefault(res.chunk_id, set()).update(res.retrievers)
+    for ranked, weight in ((vector_hits, 1.0), (bm25_hits, bm25_scaled)):
+        if weight <= 0:
+            continue
+        for rank, res in enumerate(ranked[:pool], start=1):
+            section = res.section_citation
+            fused[section] = fused.get(section, 0.0) + weight / (rrf_k + rank)
+            best_chunk.setdefault(section, res.chunk_id)
+            retrievers.setdefault(section, set()).update(res.retrievers)
 
-    top = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:k]
-    return [_result(conn, cid, score, sorted(retrievers[cid])) for cid, score in top]
+    # A query that names a section ("§ 25.14", "4 CFR 25.14") is a known-item
+    # lookup, not a search: an exact citation match is certainty, and ranked
+    # similarity cannot outvote it. Without this the vector side — which has no
+    # notion of citations and returns neighbouring sections — outranks the
+    # requested section about half the time. No-op for queries naming no section.
+    exact = (
+        {s for s in fused if wanted & citation_tokens(s)} if wanted else frozenset()
+    )
+
+    top = sorted(fused.items(), key=lambda kv: (kv[0] in exact, kv[1]), reverse=True)[:k]
+    return [
+        _result(conn, best_chunk[section], score, sorted(retrievers[section]))
+        for section, score in top
+    ]
 
 
 def _snippet(text: str, n: int = 200) -> str:

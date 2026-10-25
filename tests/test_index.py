@@ -7,6 +7,7 @@ exercises the real sqlite-vec KNN path.
 
 from __future__ import annotations
 
+import pickle
 import re
 
 import numpy as np
@@ -113,6 +114,40 @@ def test_build_populates_chunks_vectors_bm25_meta(built):
         assert conn.execute("select count(*) from bm25").fetchone()[0] == 1
         assert store.get_model_name(conn) == "fake-bow-v1"
         assert int(store.get_meta(conn)["dim"]) == emb.dim
+    finally:
+        conn.close()
+
+
+def test_bm25_index_records_its_analyzer_version(built):
+    db_path, _, _ = built
+    conn = store.connect(db_path)
+    try:
+        blob = conn.execute("select data from bm25 where id = 1").fetchone()["data"]
+        assert pickle.loads(blob)["analyzer_version"] == store.ANALYZER_VERSION
+    finally:
+        conn.close()
+
+
+def test_stale_analyzer_version_forces_a_rebuild(built):
+    """Querying an index tokenized by an older analyzer returns near-garbage,
+    because the two do not agree on what a term is. It must rebuild instead."""
+    db_path, _, _ = built
+    conn = store.connect(db_path)
+    try:
+        stale = pickle.dumps({"ids": ["bogus"], "model": None, "analyzer_version": 1})
+        conn.execute("update bm25 set data = ? where id = 1", (stale,))
+        conn.commit()
+
+        ids, model = store.load_bm25(conn)
+        assert ids != ["bogus"]
+        assert model is not None
+        assert len(ids) == len(FIXTURE_CHUNKS)
+
+        # and the rebuild is persisted, so the next query does not redo it
+        refreshed = pickle.loads(
+            conn.execute("select data from bm25 where id = 1").fetchone()["data"]
+        )
+        assert refreshed["analyzer_version"] == store.ANALYZER_VERSION
     finally:
         conn.close()
 

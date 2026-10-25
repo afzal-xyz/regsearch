@@ -94,6 +94,26 @@ def test_evaluate_end_to_end(index):
     assert hybrid["n"] == 2
 
 
+def test_summary_splits_by_question_kind(index):
+    """Prose questions and citation lookups are different tasks; one blended
+    number hides movement in both."""
+    conn, emb = index
+    gold = [
+        dict(GOLD[0], kind="prose"),
+        dict(GOLD[1], kind="citation"),
+        GOLD[2],  # negative, and no explicit kind -> defaults to prose
+    ]
+    result = run.evaluate(gold, ["hybrid"], conn=conn, embedder=emb, k=10)
+
+    by_kind = result["summary_by_kind"]
+    assert set(by_kind) == {"prose", "citation"}
+    # the negative is excluded from scoring, so prose has one scored question
+    assert by_kind["prose"]["hybrid"]["n"] == 1
+    assert by_kind["citation"]["hybrid"]["n"] == 1
+    assert result["summary"]["hybrid"]["n"] == 2
+    assert all(d["kind"] in {"prose", "citation"} for d in result["details"])
+
+
 def test_details_capture_per_mode_first_hit(index):
     conn, emb = index
     result = run.evaluate(GOLD, ["vector", "bm25", "hybrid"], conn=conn, embedder=emb, k=10)

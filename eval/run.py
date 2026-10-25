@@ -103,20 +103,43 @@ def load_gold(path: Path | str) -> list[dict]:
     return approved
 
 
+METRICS = ("recall@5", "recall@10", "mrr@10")
+
+
+def _aggregate(scored: list[dict], modes) -> dict:
+    """Mean of each metric per mode over ``scored`` (one entry per question)."""
+    summary = {}
+    for m in modes:
+        summary[m] = {
+            metric: (
+                sum(s["scores"][m][metric] for s in scored) / len(scored) if scored else None
+            )
+            for metric in METRICS
+        }
+        summary[m]["n"] = len(scored)
+    return summary
+
+
 def evaluate(gold: list[dict], modes, *, conn, embedder, k: int = 10) -> dict:
     in_corpus = [g for g in gold if g["relevant_citations"]]
     negatives = [g for g in gold if not g["relevant_citations"]]
 
-    scores = {m: {"recall@5": [], "recall@10": [], "mrr@10": []} for m in modes}
+    scored: list[dict] = []
     details = []
 
     for g in gold:
         relevant = set(g["relevant_citations"])
+        # Questions phrased in everyday language and known-item citation
+        # lookups are different tasks with very different difficulty; mixing
+        # them into one number hides movement in both.
+        kind = g.get("kind", "prose")
         entry = {
             "question": g["question"],
             "relevant_citations": g["relevant_citations"],
+            "kind": kind,
             "modes": {},
         }
+        per_mode = {}
         for m in modes:
             ranked = retrieve(m, g["question"], k, conn=conn, embedder=embedder)
             entry["modes"][m] = {
@@ -124,30 +147,32 @@ def evaluate(gold: list[dict], modes, *, conn, embedder, k: int = 10) -> dict:
                 "top_sections": ranked,
             }
             if relevant:  # score in-corpus questions only
-                scores[m]["recall@5"].append(recall_at_k(ranked, relevant, 5))
-                scores[m]["recall@10"].append(recall_at_k(ranked, relevant, 10))
-                scores[m]["mrr@10"].append(reciprocal_rank_at_k(ranked, relevant, 10))
+                per_mode[m] = {
+                    "recall@5": recall_at_k(ranked, relevant, 5),
+                    "recall@10": recall_at_k(ranked, relevant, 10),
+                    "mrr@10": reciprocal_rank_at_k(ranked, relevant, 10),
+                }
+        if relevant:
+            scored.append({"kind": kind, "scores": per_mode})
         details.append(entry)
 
-    summary = {}
-    for m in modes:
-        summary[m] = {
-            metric: (sum(vals) / len(vals) if vals else None)
-            for metric, vals in scores[m].items()
-        }
-        summary[m]["n"] = len(in_corpus)
-
+    kinds = sorted({s["kind"] for s in scored})
     return {
         "k": k,
         "n_in_corpus": len(in_corpus),
         "n_negatives": len(negatives),
-        "summary": summary,
+        "summary": _aggregate(scored, modes),
+        "summary_by_kind": {
+            kind: _aggregate([s for s in scored if s["kind"] == kind], modes) for kind in kinds
+        },
         "details": details,
     }
 
 
-def _print_table(summary: dict) -> None:
+def _print_table(summary: dict, title: str = "") -> None:
     header = f"{'mode':<8} {'recall@5':>9} {'recall@10':>10} {'MRR@10':>8} {'n':>4}"
+    if title:
+        print(f"\n{title}")
     print(header)
     print("-" * len(header))
     for mode, m in summary.items():
@@ -188,7 +213,11 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         conn.close()
 
-    _print_table(result["summary"])
+    _print_table(result["summary"], "ALL in-corpus questions")
+    by_kind = result["summary_by_kind"]
+    if len(by_kind) > 1:
+        for kind, summary in by_kind.items():
+            _print_table(summary, f"kind = {kind}")
     print(
         f"\nin-corpus questions: {result['n_in_corpus']}   "
         f"negatives (excluded from metrics): {result['n_negatives']}"

@@ -44,3 +44,4 @@ eval/results/*
 .vscode/
 .DS_Store
 Thumbs.db
+model_*.txt

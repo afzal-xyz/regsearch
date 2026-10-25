@@ -12,15 +12,34 @@ What's built and what's next. Every retrieval change gets measured against
 - [x] Hybrid retrieval with reciprocal rank fusion
 - [x] Eval harness: 47-question gold set, recall@k / MRR, per-question detail
 - [x] CI: ruff + offline pytest on GitHub Actions
+- [x] **Make hybrid beat vector-only.** Section-level fusion + confidence-weighted
+      BM25 took recall@10 from 0.76 to 0.93, past vector-only's 0.90. See
+      "Hybrid fusion" in the README.
+- [x] Section-aware dedup: hybrid now fuses over sections and returns one result each
+- [x] **Citation-aware BM25 tokenizer + stemming.** Keeps `§ 2.3(b)(1)` and
+      `4 CFR 25.14` whole and normalizes every spelling onto one token; indexes
+      the citation and heading path, not just the body. Retrieval by citation
+      went from 0.01 to 1.00 hit@1, and BM25 recall@10 from 0.55 to 0.69.
+- [x] **Expand section ranges.** `§§ 28.18 through 28.21` now indexes every
+      section it covers, not just the endpoints, capped at 100 sections. A
+      lookup for an interior section finds the text governing it; before, it
+      never did.
+- [x] Gold set split by question `kind`, with 6 citation lookups added — two
+      of which target the middle of a range. `eval/run.py` reports prose and
+      citation metrics separately, since blending them hides both.
 
 ## Next: retrieval quality
 
-- [ ] **Make hybrid beat vector-only.** Plain RRF (recall@10 0.76) currently
-      trails vector-only search (0.90). Try weighted RRF, score-normalized fusion,
-      and better BM25 tokenization (stemming, keeping legal tokens like `§` and
-      `(b)(1)`).
 - [ ] Cross-encoder reranker (`rag/`) over the fused top-k
-- [ ] Section-aware dedup: merge chunks that come from the same section in the results
+- [ ] **Re-tune the BM25 confidence thresholds on a larger gold set.** They sit
+      on a wide plateau on Title 4, but 42 answerable questions over one small
+      title is thin evidence that the chosen contrast band transfers. They are
+      calibrated per `ANALYZER_VERSION` and must be re-checked with it.
+- [ ] Revisit stemming once the gold set is larger — Porter2 edged out the
+      conservative S-stemmer by one question, but conflates applicant/applicable
+      and administrator/administrative (see the README)
+- [ ] Grow the citation-lookup set beyond 6 questions. It is enough to catch a
+      regression, not to tune against.
 - [ ] Grow the gold set beyond Title 4 and add harder paraphrase and negative questions
 - [ ] Track eval results over time (compare against the last run, flag regressions)
 

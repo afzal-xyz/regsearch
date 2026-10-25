@@ -19,7 +19,6 @@ from __future__ import annotations
 import json
 import logging
 import pickle
-import re
 import sqlite3
 import time
 from pathlib import Path
@@ -29,6 +28,11 @@ import sqlite_vec
 from rank_bm25 import BM25Okapi
 
 from index.embedder import DEFAULT_MODEL, contextualize
+from index.tokenizer import (  # re-exported: the BM25 analyzer
+    ANALYZER_VERSION,
+    bm25_document,
+    tokenize,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,16 +53,8 @@ _CHUNK_COLUMNS = [
     "text",
 ]
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-
 class ModelMismatchError(RuntimeError):
     """Raised when an embedder's model does not match the index's meta table."""
-
-
-def tokenize(text: str) -> list[str]:
-    """Lowercase ``[a-z0-9]+`` tokenizer, shared by BM25 build and query time."""
-    return _TOKEN_RE.findall(text.lower())
 
 
 def connect(db_path: Path | str = DEFAULT_DB) -> sqlite3.Connection:
@@ -187,14 +183,24 @@ def _insert_chunk(conn: sqlite3.Connection, chunk: dict, vector: np.ndarray) -> 
     )
 
 
+_BM25_SELECT = "select chunk_id, citation, heading_path, text from chunks order by id"
+
+
+def _build_bm25(rows: list[sqlite3.Row]):
+    ids = [r["chunk_id"] for r in rows]
+    # dict(row): bm25_document takes a chunk mapping, and sqlite3.Row is
+    # neither a dict nor an attribute-style object.
+    docs = [tokenize(bm25_document(dict(r))) for r in rows]
+    return ids, (BM25Okapi(docs) if rows else None)
+
+
 def _rebuild_bm25(conn: sqlite3.Connection) -> None:
-    rows = conn.execute("select chunk_id, text from chunks order by id").fetchall()
+    rows = conn.execute(_BM25_SELECT).fetchall()
     conn.execute("delete from bm25")
     if not rows:
         return
-    ids = [r["chunk_id"] for r in rows]
-    model = BM25Okapi([tokenize(r["text"]) for r in rows])
-    blob = pickle.dumps({"ids": ids, "model": model})
+    ids, model = _build_bm25(rows)
+    blob = pickle.dumps({"ids": ids, "model": model, "analyzer_version": ANALYZER_VERSION})
     conn.execute("insert into bm25(id, data) values (1, ?)", (blob,))
 
 
@@ -204,20 +210,38 @@ def load_bm25(conn: sqlite3.Connection):
     The index is pickled into the ``bm25`` blob. Pickle is safe here because the
     database is a LOCAL, TRUSTED artifact that RegSearch builds itself — it is
     never sourced from an untrusted party, so pickle's arbitrary-code-execution
-    risk does not apply. If the blob is missing or unreadable (e.g. a rank-bm25
-    upgrade changed the pickle layout), we transparently rebuild from
-    ``chunks.text`` so search still works.
+    risk does not apply.
+
+    Rebuilds from ``chunks.text`` when the blob is missing, unreadable (e.g. a
+    rank-bm25 upgrade changed the pickle layout), or was tokenized by a
+    different ``ANALYZER_VERSION``. That last case matters: querying an index
+    built by the old analyzer with the new one silently returns near-garbage,
+    because the two do not agree on what a term is.
     """
     row = conn.execute("select data from bm25 where id = 1").fetchone()
     if row and row["data"]:
         try:
             payload = pickle.loads(row["data"])
-            return payload["ids"], payload["model"]
+            if payload.get("analyzer_version") == ANALYZER_VERSION:
+                return payload["ids"], payload["model"]
+            logger.warning(
+                "bm25 index was tokenized by analyzer v%s but this is v%s; rebuilding",
+                payload.get("analyzer_version", 1),
+                ANALYZER_VERSION,
+            )
         except Exception:  # noqa: BLE001 - any unpickle failure -> rebuild
             logger.warning("bm25 blob unreadable; rebuilding from chunks.text")
-    rows = conn.execute("select chunk_id, text from chunks order by id").fetchall()
-    ids = [r["chunk_id"] for r in rows]
-    model = BM25Okapi([tokenize(r["text"]) for r in rows]) if rows else None
+
+    rows = conn.execute(_BM25_SELECT).fetchall()
+    ids, model = _build_bm25(rows)
+    if rows:
+        # Persist, so the next query does not pay for the rebuild again. Best
+        # effort: a read-only database is still perfectly searchable.
+        try:
+            _rebuild_bm25(conn)
+            conn.commit()
+        except sqlite3.Error:
+            logger.warning("could not persist rebuilt bm25 index", exc_info=True)
     return ids, model
 
 

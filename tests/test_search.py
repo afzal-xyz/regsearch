@@ -71,6 +71,94 @@ def test_query_model_mismatch_fails_loudly(index):
         search.hybrid_search("financial disclosure", 3, conn=conn, embedder=wrong)
 
 
+class TestBm25Confidence:
+    """Contrast-based gating of a BM25 ranking (see search.bm25_confidence)."""
+
+    def test_flat_ranking_is_noise(self):
+        # Nothing stands out: every chunk scores about the same.
+        assert search.bm25_confidence([10.0] * 20) == 0.0
+
+    def test_peaked_ranking_is_trusted(self):
+        # The top hit towers over rank 10 — a real lexical match.
+        assert search.bm25_confidence([50.0] + [10.0] * 19) == 1.0
+
+    def test_ramps_between_thresholds(self):
+        lo, hi = search.BM25_CONTRAST_LO, search.BM25_CONTRAST_HI
+        midpoint = (lo + hi) / 2
+        scores = [midpoint] + [1.0] * 19
+        assert search.bm25_confidence(scores) == pytest.approx(0.5)
+
+    def test_contrast_is_scale_free(self):
+        """Doubling every score (e.g. a longer query) must not change trust."""
+        scores = [3.0] + [1.0] * 19
+        assert search.bm25_confidence([2 * s for s in scores]) == search.bm25_confidence(scores)
+
+    def test_few_matches_is_discriminative_not_noise(self):
+        # Only three chunks share any term with the query at all.
+        assert search.bm25_confidence([9.0, 8.0, 7.0]) == 1.0
+
+    def test_no_matches(self):
+        assert search.bm25_confidence([]) == 0.0
+        assert search.bm25_confidence([0.0] * 20) == 0.0
+
+
+def test_noisy_bm25_does_not_displace_the_top_vector_hit(index):
+    """The regression that made plain RRF score below vector-only search.
+
+    With a zero-confidence BM25 ranking, hybrid must fall back to semantic
+    order rather than letting arbitrary keyword hits crowd the top.
+    """
+    conn, emb = index
+    query = "financial disclosure gao employee file"
+    vector_only = search.vector_search(query, 4, conn=conn, embedder=emb)
+    hybrid = search.hybrid_search(query, 4, conn=conn, embedder=emb, bm25_weight=0.0)
+    assert [r.section_citation for r in hybrid] == [r.section_citation for r in vector_only]
+    assert hybrid[0].citation == DISCLOSURE
+
+
+class TestExactCitationLookup:
+    """Naming a section is a known-item lookup, not a similarity search."""
+
+    def test_citation_query_returns_that_section_first(self, index):
+        conn, emb = index
+        for query in ("§ 8.1", "4 CFR 8.1", "section 8.1"):
+            top = search.hybrid_search(query, 4, conn=conn, embedder=emb)[0]
+            assert top.section_citation == TRAVEL, query
+
+    def test_prose_queries_are_unaffected(self, index):
+        """No citation in the query means no exact-match promotion at all."""
+        conn, emb = index
+        results = search.hybrid_search(
+            "financial disclosure gao employee file", 4, conn=conn, embedder=emb
+        )
+        assert results[0].citation == DISCLOSURE
+
+    def test_citation_in_query_overrides_the_confidence_gate(self, index, monkeypatch):
+        """BM25 must not be gated off when the query names a section.
+
+        The contrast heuristic guesses whether BM25 found a real lexical
+        anchor; a citation in the query answers that directly. Pinned because
+        a flat-looking score curve silently discarded the one ranking that
+        knew where a cited section was referenced.
+        """
+        conn, emb = index
+        monkeypatch.setattr(search, "bm25_confidence", lambda *a, **kw: 0.0)
+        results = search.hybrid_search("§ 8.1", 4, conn=conn, embedder=emb)
+        assert any("bm25" in r.retrievers for r in results)
+
+    def test_a_number_in_prose_is_not_a_citation_lookup(self, index):
+        """"8.1" alone reads as a section, but "8 hours" must not."""
+        assert search.citation_tokens("how many hours of annual leave") == set()
+        assert "§8.1" in search.citation_tokens("what does § 8.1 say")
+
+
+def test_hybrid_returns_one_result_per_section(index):
+    conn, emb = index
+    results = search.hybrid_search("employee gao report", 4, conn=conn, embedder=emb)
+    sections = [r.section_citation for r in results]
+    assert len(sections) == len(set(sections))
+
+
 def test_results_carry_pure_text_and_citation(index):
     conn, emb = index
     results = search.vector_search("ethics conflict", 2, conn=conn, embedder=emb)
