@@ -10,7 +10,7 @@ What's built and what's next. Every retrieval change gets measured against
 - [x] Hierarchy-aware chunker with full citation and paragraph anchors
 - [x] Embeddings (bge-small) + sqlite-vec store + persisted BM25 index
 - [x] Hybrid retrieval with reciprocal rank fusion
-- [x] Eval harness: 47-question gold set, recall@k / MRR, per-question detail
+- [x] Eval harness: 61-question gold set, recall@k / MRR, per-question detail
 - [x] CI: ruff + offline pytest on GitHub Actions
 - [x] **Make hybrid beat vector-only.** Section-level fusion + confidence-weighted
       BM25 took recall@10 from 0.76 to 0.93, past vector-only's 0.90. See
@@ -27,21 +27,33 @@ What's built and what's next. Every retrieval change gets measured against
 - [x] Gold set split by question `kind`, with 6 citation lookups added — two
       of which target the middle of a range. `eval/run.py` reports prose and
       citation metrics separately, since blending them hides both.
+- [x] **Citation override only for sections that exist.** Naming a
+      non-existent section (`4 CFR 4.999`) or one from another title
+      (`31 CFR 1010.230`) used to force full BM25 trust on the leftover prose,
+      pulling keyword noise into the top 5. Both are now negative gold
+      questions, and the override checks the index first.
+- [x] Citation-lookup set grown from 6 to 12 (three target the middle of a
+      range), plus the 2 citation-form negatives above. Hybrid: recall@5 0.92,
+      recall@10 1.00, MRR 0.83; prose metrics unchanged.
+- [x] **Eval run comparison + regression gate + report** (`eval/compare.py`):
+      diffs the latest run against the previous or a pinned baseline per mode
+      and question kind, fails CI when a metric drops more than the threshold
+      (adaptive 1.5/n by default, `--threshold` for flat), and renders
+      `eval/report.html` — delta tables plus full history with git commits and
+      trend sparklines. `eval/run.py` stamps each run with its commit and
+      refreshes the page.
 
 ## Next: retrieval quality
 
 - [ ] Cross-encoder reranker (`rag/`) over the fused top-k
 - [ ] **Re-tune the BM25 confidence thresholds on a larger gold set.** They sit
-      on a wide plateau on Title 4, but 42 answerable questions over one small
+      on a wide plateau on Title 4, but 54 answerable questions over one small
       title is thin evidence that the chosen contrast band transfers. They are
       calibrated per `ANALYZER_VERSION` and must be re-checked with it.
 - [ ] Revisit stemming once the gold set is larger — Porter2 edged out the
       conservative S-stemmer by one question, but conflates applicant/applicable
       and administrator/administrative (see the README)
-- [ ] Grow the citation-lookup set beyond 6 questions. It is enough to catch a
-      regression, not to tune against.
-- [ ] Grow the gold set beyond Title 4 and add harder paraphrase and negative questions
-- [ ] Track eval results over time (compare against the last run, flag regressions)
+- [ ] Grow the gold set beyond Title 4 and add harder paraphrase and prose negative questions
 
 ## Next: answers
 

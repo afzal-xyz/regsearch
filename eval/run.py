@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,27 @@ from retrieval import search
 logger = logging.getLogger(__name__)
 
 DEFAULT_GOLD = Path("eval/gold.jsonl")
+
+
+def git_commit() -> str | None:
+    """Short SHA of HEAD, with ``-dirty`` when the tree has local changes.
+
+    Recorded into each results file so a run can be traced back to the code
+    that produced it (``eval/compare.py`` shows it in the history). Best
+    effort: outside a git checkout this is simply null.
+    """
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return f"{head}-dirty" if status else head
 DEFAULT_RESULTS_DIR = Path("eval/results")
 MODES = ("vector", "bm25", "hybrid")
 
@@ -228,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     out_path = args.results_dir / f"{stamp}.json"
     payload = {
         "timestamp": stamp,
+        "git_commit": git_commit(),
         "gold": str(args.gold),
         "db": args.db,
         "model": args.model,
@@ -236,6 +259,15 @@ def main(argv: list[str] | None = None) -> int:
     }
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"wrote {out_path}")
+
+    # Refresh the standing HTML report so eval/report.html always reflects the
+    # latest run. Comparison and the regression gate stay in eval/compare.py —
+    # this only re-renders the page.
+    from eval import compare
+
+    report = compare.write_report(results_dir=args.results_dir)
+    if report:
+        print(f"wrote {report}")
     return 0
 
 

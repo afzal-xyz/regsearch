@@ -45,3 +45,6 @@ eval/results/*
 .DS_Store
 Thumbs.db
 model_*.txt
+
+# Eval report page (regenerated from eval/results/)
+eval/report.html

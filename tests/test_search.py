@@ -166,3 +166,54 @@ def test_results_carry_pure_text_and_citation(index):
     assert top.citation.startswith("4 CFR")
     assert "Title 4" not in top.text  # pure body only
     assert top.heading_path[0] == "Title 4—Accounts"
+
+
+class TestCitationToMissingSection:
+    """A citation only counts as a lexical anchor if the section is indexed.
+
+    Naming § 4.999 (which does not exist) or 31 CFR 1010.230 (another title)
+    gives BM25 nothing to match on: it ends up ranking the question's leftover
+    prose, and that ranking must stay subject to the confidence gate.
+    """
+
+    def test_indexed_section_tokens_reflect_the_index(self, index):
+        conn, _ = index
+        tokens = search.indexed_section_tokens(conn)
+        assert {"§7.3", "4cfr7.3", "§8.1"} <= tokens
+        assert "§4.999" not in tokens
+        assert "§1010.230" not in tokens
+
+    def test_missing_section_does_not_override_the_gate(self, index, monkeypatch):
+        conn, emb = index
+        monkeypatch.setattr(search, "bm25_confidence", lambda *a, **kw: 0.0)
+        for query in ("recordkeeping requirements in 4 CFR 4.999", "31 CFR 1010.230 banks"):
+            results = search.hybrid_search(query, 4, conn=conn, embedder=emb)
+            assert results, query
+            assert all("bm25" not in r.retrievers for r in results), query
+
+    def test_missing_section_falls_back_to_semantic_order(self, index):
+        conn, emb = index
+        query = "financial disclosure gao employee file, see 4 CFR 4.999"
+        hybrid = search.hybrid_search(query, 4, conn=conn, embedder=emb)
+        # The fictitious citation must not promote anything: top hit is still
+        # whatever the prose points at.
+        assert hybrid[0].citation == DISCLOSURE
+
+    def test_known_section_still_overrides(self, index, monkeypatch):
+        conn, emb = index
+        monkeypatch.setattr(search, "bm25_confidence", lambda *a, **kw: 0.0)
+        results = search.hybrid_search("4 CFR 8.1", 4, conn=conn, embedder=emb)
+        assert results[0].section_citation == TRAVEL
+        assert any("bm25" in r.retrievers for r in results)
+
+    def test_cache_invalidates_when_index_grows(self, index):
+        conn, emb = index
+        before = search.indexed_section_tokens(conn)
+        assert "§9.9" not in before
+        conn.execute(
+            "insert into chunks(chunk_id, citation, section_citation, heading, heading_path, "
+            "title, date, text) values (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("4-2024-07-18-9.9-000", "4 CFR § 9.9", "4 CFR § 9.9", "§ 9.9 X.", "[]", 4, "d", "x"),
+        )
+        conn.commit()
+        assert "§9.9" in search.indexed_section_tokens(conn)

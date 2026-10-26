@@ -176,6 +176,30 @@ def bm25_confidence(
     return (contrast - lo) / (hi - lo)
 
 
+# Per-connection cache for :func:`indexed_section_tokens`, keyed by ``id(conn)``
+# and invalidated when the chunk count changes.
+_SECTION_TOKEN_CACHE: dict[int, tuple[int, frozenset[str]]] = {}
+
+
+def indexed_section_tokens(conn: sqlite3.Connection) -> frozenset[str]:
+    """Citation tokens of every section in the index (``{"§25.14", "4cfr25.14", ...}``).
+
+    Lets a caller ask "is the section this query names actually in the
+    corpus?", which :func:`citation_tokens` alone cannot answer — it will
+    happily extract ``§4.999`` from a question about a section that does not
+    exist. Cached per connection; the cache is dropped when the chunk count
+    changes, so a rebuilt index is picked up without reconnecting.
+    """
+    n = conn.execute("select count(*) from chunks").fetchone()[0]
+    cached = _SECTION_TOKEN_CACHE.get(id(conn))
+    if cached and cached[0] == n:
+        return cached[1]
+    rows = conn.execute("select distinct section_citation from chunks").fetchall()
+    tokens = frozenset().union(*(citation_tokens(r[0]) for r in rows)) if rows else frozenset()
+    _SECTION_TOKEN_CACHE[id(conn)] = (n, tokens)
+    return tokens
+
+
 def _best_per_section(results: list[SearchResult]) -> list[SearchResult]:
     """Collapse a ranked chunk list to its best chunk per section, order kept.
 
@@ -208,8 +232,10 @@ def hybrid_search(
     1-based ranks over its ``pool`` best *sections*. Vector always has weight
     1.0; BM25 has ``bm25_weight`` scaled by :func:`bm25_confidence`, so a BM25
     ranking that looks like noise is damped or ignored entirely and hybrid
-    falls back to pure semantic order — unless the query names a section, in
-    which case BM25 has a verified lexical anchor and is trusted outright.
+    falls back to pure semantic order — unless the query names a section that
+    is in the index, in which case BM25 has a verified lexical anchor and is
+    trusted outright. A citation to a section the index does not hold (a
+    non-existent number, or another title) gets no such treatment.
 
     Returns up to ``k`` results, one per section — the section's best-matching
     chunk, carrying the fused score.
@@ -218,15 +244,27 @@ def hybrid_search(
     vector_hits = _best_per_section(vector_search(query, chunk_pool, conn=conn, embedder=embedder))
     bm25_chunks = bm25_search(query, chunk_pool, conn=conn)
 
+    # Sections the query names that are actually in the index. A query can
+    # cite a section that does not exist (§ 4.999) or lives in a title that
+    # was never ingested (31 CFR 1010.230); those are *not* a lexical anchor.
     wanted = citation_tokens(query)
-    if wanted:
+    known = wanted & indexed_section_tokens(conn) if wanted else frozenset()
+    if known:
         # bm25_confidence infers "did BM25 find a real lexical anchor" from the
         # shape of its scores, because normally there is nothing better to go
-        # on. A query that names a section gives us that answer directly, and
-        # a citation is the most discriminating term there is — so do not let
-        # the heuristic veto it. Without this, a question citing a section
-        # whose score curve happens to look flat loses BM25 entirely, which is
-        # exactly the ranking that knows where that section is referenced.
+        # on. A query that names an indexed section gives us that answer
+        # directly, and a citation is the most discriminating term there is —
+        # so do not let the heuristic veto it. Without this, a question citing
+        # a section whose score curve happens to look flat loses BM25
+        # entirely, which is exactly the ranking that knows where that section
+        # is referenced.
+        #
+        # The check against the index matters: when the cited section is
+        # absent, the citation tokens match nothing and BM25 is ranking on the
+        # question's remaining prose alone. Forcing full trust there injects
+        # an arbitrary keyword ranking at full weight — measured on the
+        # negative citation questions in eval/gold.jsonl, it pulled unrelated
+        # sections into the top 5 that the confidence gate would have damped.
         confidence = 1.0
     else:
         # Read off the raw chunk scores, before section de-duping.
@@ -250,10 +288,9 @@ def hybrid_search(
     # lookup, not a search: an exact citation match is certainty, and ranked
     # similarity cannot outvote it. Without this the vector side — which has no
     # notion of citations and returns neighbouring sections — outranks the
-    # requested section about half the time. No-op for queries naming no section.
-    exact = (
-        {s for s in fused if wanted & citation_tokens(s)} if wanted else frozenset()
-    )
+    # requested section about half the time. No-op for queries naming no
+    # section, or naming one that is not in the index.
+    exact = {s for s in fused if known & citation_tokens(s)} if known else frozenset()
 
     top = sorted(fused.items(), key=lambda kv: (kv[0] in exact, kv[1]), reverse=True)[:k]
     return [

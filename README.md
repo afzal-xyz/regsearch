@@ -36,10 +36,12 @@ eCFR API ──► fetcher ──► XML parser ──► chunker ──► inde
 - **`retrieval/`**: vector, BM25 and hybrid search. The hybrid mode fuses the
   two rankings over *sections*, weighting BM25 by how much it can be trusted on
   that particular query (see [Hybrid fusion](#hybrid-fusion)).
-- **`eval/`**: a hand-written gold set of 53 questions (`eval/gold.jsonl`) —
+- **`eval/`**: a hand-written gold set of 61 questions (`eval/gold.jsonl`) —
   prose questions, citation lookups, and some with no answer in the corpus —
   plus a harness that reports recall@5, recall@10 and MRR@10 per retrieval
-  mode, broken out by question `kind`.
+  mode, broken out by question `kind`. `eval/compare.py` diffs runs against
+  the previous one or a pinned baseline, fails on regressions beyond a
+  threshold, and renders `eval/report.html` with the full run history.
 
 ## Built with
 
@@ -91,12 +93,14 @@ uv run python -m retrieval.search "when must a GAO employee file a financial dis
 uv run python -m eval.run            # all modes; --mode vector|bm25|hybrid
 ```
 
-Results go to `eval/results/`. Current baseline on Title 4 (245 chunks, 42
-answerable questions):
+Results go to `eval/results/` (one JSON per run, stamped with the git commit
+it ran on). Current baseline on Title 4 (245 chunks, 61 questions: 54
+answerable, 7 with no answer in the corpus).
 
-The gold set holds two kinds of question, reported separately because they are
-different tasks: 42 phrased in everyday language, and 6 known-item lookups that
-name a section outright.
+The answerable questions are two kinds, reported separately because they are
+different tasks: 42 phrased in everyday language, and 12 known-item lookups that
+name a section outright. Negatives are excluded from recall/MRR; their rankings
+are recorded per question in the results JSON.
 
 **Prose questions** (n = 42):
 
@@ -109,17 +113,51 @@ name a section outright.
 Hybrid beats vector-only on all three, and 0.93 is the ceiling set by the union
 of what either retriever finds at all.
 
-**Citation lookups** (n = 6):
+**Citation lookups** (n = 12):
 
 | Mode   | recall@5 | recall@10 | MRR@10   |
 | ------ | -------- | --------- | -------- |
-| vector | 0.33     | 0.50      | 0.35     |
-| bm25   | **1.00** | **1.00**  | **0.88** |
-| hybrid | 0.83     | **1.00**  | 0.77     |
+| vector | 0.67     | 0.75      | 0.54     |
+| bm25   | **1.00** | **1.00**  | **0.90** |
+| hybrid | 0.92     | **1.00**  | 0.83     |
+
+Nine of the twelve land at rank 1 in hybrid. The misses are the three
+mid-range lookups, where the answer is a section that *covers* the cited one
+via a `§§ X through Y` range rather than naming it (see
+[Section ranges](#section-ranges)): hybrid ranks them 2, 3 and 8.
 
 Vector search is near-useless here — embeddings have no notion of a citation —
 which is why BM25 carries this case. See
 [BM25 tokenization](#bm25-tokenization).
+
+### 5. Compare runs and catch regressions
+
+```bash
+uv run python -m eval.compare                          # latest vs previous run
+uv run python -m eval.compare --against 20261025-131252.json   # vs a pinned baseline
+uv run python -m eval.compare --threshold 0.05         # flat threshold
+uv run python -m eval.compare --no-fail                # warn-only (never exit 1)
+```
+
+Prints every metric's change per mode and per question kind, flags any drop,
+and exits non-zero when a drop exceeds the threshold — so CI can run it after
+`eval.run` and block a retrieval regression. It also (re)writes
+**`eval/report.html`**, a self-contained page with the latest-vs-reference
+delta tables, a verdict line, and the full run history — every run's metrics,
+its git commit, and recall@10 trend sparklines per kind. `eval/run.py`
+refreshes the page after every run, so opening it always shows current state.
+
+**The default threshold is adaptive: a metric may drop by at most 1.5/n for
+its own group.** These metrics move in steps of one question (1/n): on the 42
+prose questions one flipped question moves recall by 0.024, while on the 12
+citation lookups it moves it by 0.083. A single flat number either ignores
+real two-question losses in the big group or cries wolf on one-question noise
+in the small one. 1.5/n sits between one question and two — a lone borderline
+question re-ranking is noise on a hand-written gold set this size, a second
+one is a pattern — and it scales automatically as the gold set grows (the
+slack tightens, which is what more evidence should do). Pass `--threshold` for
+a flat absolute limit when comparing across gold-set changes, where n itself
+moved.
 
 ## Hybrid fusion
 
@@ -154,7 +192,7 @@ improves (0.81 → 0.83) and MRR holds at parity; raising MRR is the reranker's 
 
 Two caveats worth knowing: the gains hold across a wide parameter plateau
 (`rrf_k` 5–60, pools 30–150, contrast thresholds 1.4–1.7), so they come from the
-structure rather than tuned constants — but 42 answerable questions over one small
+structure rather than tuned constants — but 54 answerable questions over one small
 title is a thin basis for the thresholds, which should be re-tuned as the gold set
 grows. And because vector dominates BM25 so heavily on this corpus, hybrid is
 deliberately skewed semantic; a corpus with more exact-term queries would want the
@@ -212,8 +250,22 @@ override, a question citing a section whose score curve happened to look flat
 lost BM25 entirely — discarding the one ranking that knew where that section
 was referenced.
 
-Both behaviours are inert for queries naming no section, so the prose metrics
-above are untouched by them.
+The override applies only when the cited section is actually in the index.
+A citation can name a section that does not exist (`4 CFR 4.999`) or one from
+a title that was never ingested (`31 CFR 1010.230`); in both cases the
+citation tokens match nothing and BM25 is left ranking the question's leftover
+prose, which is exactly the noise the gate exists to catch. Forcing full trust
+there made it worse: on the § 4.999 negative, BM25's natural confidence was
+0.37, the unconditional override pushed § 4.3 (*Removal for unacceptable
+performance*) into the top 5 on keyword overlap alone, and restricting the
+override to indexed sections returns hybrid to semantic order. The gold set
+carries both negatives, so a regression here shows up in their recorded
+rankings. On the Title 31 negative the gate already rated BM25 fully
+confident, so the override was moot — the gate's own false positives are a
+separate problem.
+
+All of these behaviours are inert for queries naming no section, so the prose
+metrics above are untouched by them.
 
 ### Section ranges
 
