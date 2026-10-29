@@ -39,7 +39,9 @@ logger = logging.getLogger(__name__)
 #   1: naive [a-z0-9]+ over chunk text
 #   2: citation-aware + plural stemming
 #   3: index citation and heading path alongside the text
-ANALYZER_VERSION = 4
+#   4: section-range expansion; subdivided citations emit their parent
+#   5: drop English stopwords (see _STOPWORDS)
+ANALYZER_VERSION = 5
 
 
 def bm25_document(chunk) -> str:
@@ -139,6 +141,34 @@ def _range_tokens(low: str, high: str) -> list[str]:
     return [f"§{stem_}.{n}" for n in range(start, end + 1)]
 
 
+# --- stopwords ---------------------------------------------------------------
+
+# Dropped from both documents and queries. rank_bm25 clamps a negative-IDF
+# term (one in more than half the corpus) to ``epsilon * average_idf`` instead
+# of zero, so ubiquitous function words retain real weight — and that floor
+# *grows* with the corpus, because rarer vocabulary pushes the average IDF up.
+# On the 245-chunk Title 4 index this was noise; at 6,262 chunks (Titles 4+31)
+# a stopword-heavy section outscored a document holding a unique citation
+# token: "Where are the terms used in § 1010.615 defined?" ranked the one
+# section containing §1010.615 at 71, under sections matching only
+# "where/the/term/used". Removing stopwords from the vocabulary entirely is
+# the fix the rank_bm25 API allows (its epsilon is not exposed per-index).
+#
+# The list is function words only: articles, prepositions, pronouns,
+# auxiliaries, and the modals ("shall", "may", "must") that appear in nearly
+# every regulatory sentence and so discriminate nothing. Content words stay,
+# however common — "employee", "agency", "record" are what prose queries are
+# made of. Citation tokens are never stopwords.
+_STOPWORDS = frozenset(
+    """
+    a an and any are as at be been both but by can could did do does for from
+    had has have how i if in into is it its may me must my no nor not of on or
+    our shall should so such than that the their them then there these they
+    this those to under upon was we were what when where which who whom whose
+    why will with within would you your
+    """.split()
+)
+
 # --- stemming ---------------------------------------------------------------
 
 # Words whose final "s"/"es" is not a plural, or where stripping it changes the
@@ -195,6 +225,8 @@ def _scan(text: str, stemmer) -> list[tuple[str, bool]]:
         kind = m.lastgroup
         if m.group("word") is not None:
             word = m.group("word")
+            if word in _STOPWORDS:
+                continue
             tokens.append(((stemmer(word) if stemmer else word), False))
         elif m.group("cfr_num") is not None:
             # "4 CFR 25.14" names the same section as "§ 25.14"; also keep the
@@ -228,9 +260,10 @@ def _scan(text: str, stemmer) -> list[tuple[str, bool]]:
 def tokenize(text: str, *, stemmer=stem) -> list[str]:
     """Tokenize ``text`` for BM25, shared by index build and query time.
 
-    Citations are kept whole and normalized; every other token is lowercased
-    and stemmed. ``stemmer`` is injectable so alternatives can be measured
-    against the gold set; pass ``None`` to disable stemming.
+    Citations are kept whole and normalized; every other token is lowercased,
+    dropped if a stopword, and stemmed. ``stemmer`` is injectable so
+    alternatives can be measured against the gold set; pass ``None`` to
+    disable stemming.
     """
     return [token for token, _ in _scan(text, stemmer)]
 

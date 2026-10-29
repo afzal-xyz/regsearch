@@ -217,3 +217,54 @@ class TestCitationToMissingSection:
         )
         conn.commit()
         assert "§9.9" in search.indexed_section_tokens(conn)
+
+
+class TestCitedButAbsentSectionIsPromoted:
+    """A cited section can be absent from the index yet referenced by it.
+
+    "§§ 30.10 through 30.14" writes a token for every interior section into
+    the citing chunk's BM25 document; a lookup for § 30.12 must surface that
+    chunk even when the question's prose would otherwise bury it. Pinned
+    because at 6k+ chunks a single citation occurrence in a long document
+    scores below tf-stacked common words (the § 1010.615 case)."""
+
+    @pytest.fixture
+    def range_index(self, tmp_path):
+        from tests.test_index import _chunk
+
+        chunks = FIXTURE_CHUNKS + [
+            _chunk(
+                "4-2024-07-18-30.1-000", "4 CFR § 30.1", "§ 30.1 Petitions.",
+                "A petition shall be processed in accordance with §§ 30.10 through 30.14.",
+            ),
+        ]
+        db_path = tmp_path / "index" / "regsearch.db"
+        emb = FakeEmbedder()
+        store.build_index(chunks, db_path=db_path, embedder=emb, show_progress=False)
+        conn = store.connect(db_path)
+        yield conn, emb
+        conn.close()
+
+    def test_range_interior_lookup_promotes_the_citing_section(self, range_index, monkeypatch):
+        conn, emb = range_index
+        # Even with the gate voting "noise", the reference is a verified anchor.
+        monkeypatch.setattr(search, "bm25_confidence", lambda *a, **kw: 0.0)
+        results = search.hybrid_search(
+            "how is a petition processed under § 30.12", 4, conn=conn, embedder=emb
+        )
+        assert results[0].section_citation == "4 CFR § 30.1"
+
+    def test_promoted_section_ranks_below_a_true_exact_match(self, range_index):
+        conn, emb = range_index
+        # § 8.1 is indexed; § 30.12 is only referenced. The real section wins.
+        results = search.hybrid_search("§ 8.1 and § 30.12", 4, conn=conn, embedder=emb)
+        assert results[0].section_citation == TRAVEL
+        assert "4 CFR § 30.1" in [r.section_citation for r in results]
+
+    def test_unreferenced_citation_promotes_nothing(self, range_index):
+        conn, emb = range_index
+        # § 30.99 is outside the range: neither indexed nor referenced.
+        results = search.hybrid_search(
+            "financial disclosure gao employee file, see § 30.99", 4, conn=conn, embedder=emb
+        )
+        assert results[0].citation == DISCLOSURE

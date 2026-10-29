@@ -250,11 +250,16 @@ override, a question citing a section whose score curve happened to look flat
 lost BM25 entirely — discarding the one ranking that knew where that section
 was referenced.
 
-The override applies only when the cited section is actually in the index.
-A citation can name a section that does not exist (`4 CFR 4.999`) or one from
-a title that was never ingested (`31 CFR 1010.230`); in both cases the
-citation tokens match nothing and BM25 is left ranking the question's leftover
-prose, which is exactly the noise the gate exists to catch. Forcing full trust
+The override applies only when the cited section is actually in the index —
+or *referenced* by it: a section interior to a `§§ X through Y` range
+(§ 1010.615, covered by § 1010.605's range but no section itself) exists in
+the BM25 vocabulary only through range expansion, and the documents holding
+that token are the only possible answers to the lookup, so they are promoted
+just below true exact matches. A citation can instead name a section that
+does not exist at all (`4 CFR 4.999`) or one from a title that was never
+ingested; in both cases the citation tokens match nothing and BM25 is left
+ranking the question's leftover prose, which is exactly the noise the gate
+exists to catch. Forcing full trust
 there made it worse: on the § 4.999 negative, BM25's natural confidence was
 0.37, the unconditional override pushed § 4.3 (*Removal for unacceptable
 performance*) into the top 5 on keyword overlap alone, and restricting the
@@ -323,6 +328,31 @@ An "applicant" is a person seeking a job; an "applicable" rule is not. Adding
 entirely about the GAO *Building*. Those collisions cost precision in ways 42
 questions cannot detect, so the conservative stemmer is the default; `tokenize`
 takes a `stemmer=` argument for re-testing this on a larger gold set.
+
+### Stopwords
+
+English function words — articles, prepositions, pronouns, auxiliaries, and
+the modals ("shall", "may", "must") that open nearly every regulatory
+sentence — are dropped from documents and queries alike. This is not the
+usual tidy-up: rank_bm25 clamps a negative-IDF term (one in more than half
+the corpus) to `epsilon × average_idf` instead of zero, and that floor
+*grows* with the corpus, because rarer vocabulary pushes the average IDF up.
+On Title 4's 245 chunks the effect was noise; on the two-title corpus (6,262
+chunks) a stopword-heavy section outscored a document holding a unique
+citation token — "Where are the terms used in § 1010.615 defined?" ranked
+the one section containing `§1010.615` at 71, beneath sections matching only
+"where/the/term/used". Since rank_bm25 does not expose its epsilon, the fix
+is to remove stopwords from the vocabulary entirely. Content words stay,
+however common. On the gold set this lifted BM25's prose recall@5 from 0.51
+to 0.61 with recall@10 and both citation metrics unharmed.
+
+The same corpus growth also broke the confidence gate's clean calibration:
+on Title 4 alone, real lexical matches showed contrast 1.9–3.8 and noise
+1.2–1.5, but on 108 questions over two titles the two distributions overlap
+across 1.2–1.9. No threshold pair is cleanly right anymore, so the ramp was
+widened (1.4 → 2.2) to span the overlap — graded trust instead of a hard
+call — picked by grid search on the gold set. The plateau is shallow;
+re-tune with the next corpus or gold-set change.
 
 ### Re-indexing
 

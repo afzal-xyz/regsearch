@@ -45,9 +45,20 @@ class TestCitationsStayWhole:
         assert tokenize("4 CFR 83.17") == ["4cfr83.17", "§83.17"]
 
     def test_prose_around_a_citation_still_tokenizes(self):
+        # "what" and "does" are stopwords; the content words and the citation stay.
         assert tokenize("What does § 7.1 say about unions?") == [
-            "what", "does", "§7.1", "say", "about", "union",
+            "§7.1", "say", "about", "union",
         ]
+
+    def test_stopwords_are_dropped_but_content_words_stay(self):
+        """rank_bm25 gives negative-IDF terms an epsilon floor that grows with
+        the corpus; at 6k+ chunks stopword-heavy sections outscored a unique
+        citation token. Stopwords leave the vocabulary entirely instead."""
+        assert tokenize("the terms used in this part") == ["term", "used", "part"]
+
+    def test_a_stopword_is_never_a_citation(self):
+        # Stopword removal must not touch citation or statute tokens.
+        assert tokenize("as provided in 29 U.S.C. 206") == ["provided", "29usc206"]
 
 
 class TestSectionRanges:

@@ -64,9 +64,18 @@ BM25_WEIGHT = 1.0  # weight of a fully-confident BM25 ranking (vector is always 
 # These are calibrated against the analyzer in index.tokenizer: changing how
 # text is tokenized moves the score distribution, so re-tune them (and bump
 # ANALYZER_VERSION) alongside any analyzer change.
+#
+# Retuned for analyzer v5 (stopword removal) on the two-title (4 + 31) index.
+# The clean separation measured on Title 4 alone — real matches 1.9-3.8,
+# noise 1.2-1.5 — does not survive a 6,262-chunk corpus: on the 108-question
+# gold set the two distributions now overlap across 1.2-1.9, so no threshold
+# pair is cleanly right and the ramp is widened to span the overlap, trading
+# hard decisions for graded trust. Chosen by grid search on hybrid metrics
+# (eval/gold.jsonl); the plateau is shallow, so expect to re-tune again when
+# the corpus or gold set grows.
 BM25_CONTRAST_ANCHOR = 20
-BM25_CONTRAST_LO = 1.5
-BM25_CONTRAST_HI = 1.9
+BM25_CONTRAST_LO = 1.4
+BM25_CONTRAST_HI = 2.2
 
 
 @dataclass
@@ -200,6 +209,36 @@ def indexed_section_tokens(conn: sqlite3.Connection) -> frozenset[str]:
     return tokens
 
 
+def _citing_chunks(conn: sqlite3.Connection, tokens: frozenset[str]) -> list[tuple[str, str]]:
+    """Chunks whose BM25 document contains any of ``tokens``, best match first.
+
+    A citation token can be in the BM25 vocabulary without naming any indexed
+    section: range expansion writes §1010.615 into § 1010.605's document
+    because its text covers "§§ 1010.610 through 1010.630". Such a token is
+    still a verified lexical anchor — some indexed text references exactly the
+    section the query asks about — and this returns that text, as
+    ``(chunk_id, section_citation)`` pairs scored on the citation tokens
+    alone: the question's prose must not dilute what is a pure "which text
+    references this section" lookup. Empty when no token is in the
+    vocabulary (a truly non-existent citation, § 4.999).
+    """
+    ids, model = load_bm25(conn)
+    if model is None or not ids:
+        return []
+    scores = model.get_scores(sorted(tokens))
+    order = np.argsort(scores)[::-1]
+    out = []
+    for i in order:
+        if scores[i] <= 0:
+            break
+        row = conn.execute(
+            "select section_citation from chunks where chunk_id = ?", (ids[i],)
+        ).fetchone()
+        if row:
+            out.append((ids[i], row["section_citation"]))
+    return out
+
+
 def _best_per_section(results: list[SearchResult]) -> list[SearchResult]:
     """Collapse a ranked chunk list to its best chunk per section, order kept.
 
@@ -233,9 +272,10 @@ def hybrid_search(
     1.0; BM25 has ``bm25_weight`` scaled by :func:`bm25_confidence`, so a BM25
     ranking that looks like noise is damped or ignored entirely and hybrid
     falls back to pure semantic order — unless the query names a section that
-    is in the index, in which case BM25 has a verified lexical anchor and is
-    trusted outright. A citation to a section the index does not hold (a
-    non-existent number, or another title) gets no such treatment.
+    is in the index (or referenced by indexed text, e.g. the interior of a
+    "§§ X through Y" range), in which case BM25 has a verified lexical anchor
+    and is trusted outright. A citation the index neither holds nor references
+    (a non-existent number, or another title) gets no such treatment.
 
     Returns up to ``k`` results, one per section — the section's best-matching
     chunk, carrying the fused score.
@@ -249,7 +289,18 @@ def hybrid_search(
     # was never ingested (31 CFR 1010.230); those are *not* a lexical anchor.
     wanted = citation_tokens(query)
     known = wanted & indexed_section_tokens(conn) if wanted else frozenset()
-    if known:
+
+    # A cited section can be absent from the index yet *referenced* by indexed
+    # text — most often a section interior to a "§§ X through Y" range, whose
+    # token exists only because the analyzer expanded the range (§ 1010.615
+    # appears in no section citation, but § 1010.605's text covers it). The
+    # documents containing that token are the only possible answers to the
+    # lookup, so they are promoted below true exact matches (see `promoted`
+    # further down). A token in neither the sections nor the vocabulary
+    # (§ 4.999) still gets no special treatment.
+    citing = _citing_chunks(conn, wanted - known) if wanted - known else []
+
+    if known or citing:
         # bm25_confidence infers "did BM25 find a real lexical anchor" from the
         # shape of its scores, because normally there is nothing better to go
         # on. A query that names an indexed section gives us that answer
@@ -284,15 +335,34 @@ def hybrid_search(
             best_chunk.setdefault(section, res.chunk_id)
             retrievers.setdefault(section, set()).update(res.retrievers)
 
+    # The cited-but-absent case: inject the sections whose text references the
+    # cited number, in citation-match order, even when neither retriever's pool
+    # surfaced them — at 6k+ chunks a single citation occurrence in a long
+    # document scores below tf-stacked common words, so BM25 alone buries the
+    # one section that governs the request.
+    promoted: dict[str, int] = {}
+    for rank, (chunk_id, section) in enumerate(citing, start=1):
+        if section not in promoted:
+            promoted[section] = rank
+            fused.setdefault(section, 0.0)
+            best_chunk.setdefault(section, chunk_id)
+            retrievers.setdefault(section, set()).add("bm25")
+
     # A query that names a section ("§ 25.14", "4 CFR 25.14") is a known-item
     # lookup, not a search: an exact citation match is certainty, and ranked
     # similarity cannot outvote it. Without this the vector side — which has no
     # notion of citations and returns neighbouring sections — outranks the
-    # requested section about half the time. No-op for queries naming no
-    # section, or naming one that is not in the index.
+    # requested section about half the time. Sections that merely *reference* a
+    # cited-but-absent number rank just below true exact matches, best citation
+    # match first. No-op for queries naming no section, or naming one that is
+    # neither in the index nor referenced by it.
     exact = {s for s in fused if known & citation_tokens(s)} if known else frozenset()
 
-    top = sorted(fused.items(), key=lambda kv: (kv[0] in exact, kv[1]), reverse=True)[:k]
+    top = sorted(
+        fused.items(),
+        key=lambda kv: (kv[0] in exact, kv[0] in promoted, -promoted.get(kv[0], 0), kv[1]),
+        reverse=True,
+    )[:k]
     return [
         _result(conn, best_chunk[section], score, sorted(retrievers[section]))
         for section, score in top
