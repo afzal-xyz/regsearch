@@ -32,7 +32,18 @@ DEFAULT_MIN_INTERVAL = 1.0  # seconds between network requests (be polite to eCF
 DATA_RAW = Path("data/raw")
 
 _CHUNK_SIZE = 64 * 1024
-_REQUEST_TIMEOUT = (10, 120)  # (connect, read) seconds
+# (connect, read) seconds. The read timeout is generous because eCFR renders a
+# full title on demand: Title 31 takes over a minute before the first byte.
+_REQUEST_TIMEOUT = (10, 300)
+
+# Retry policy. A full-title render is slow and eCFR sheds load under it — a
+# 504 Gateway Time-out on the first attempt at a large title is routine, and
+# the identical request succeeds minutes later. Without retry, onboarding a
+# big title is a coin flip, so the pipeline treats these as transient.
+DEFAULT_MAX_ATTEMPTS = 4
+DEFAULT_BACKOFF = 15.0  # seconds before the 2nd attempt; doubles each time
+_BACKOFF_CAP = 300.0
+_RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 # Module-level timestamp used for simple cross-call rate limiting.
 _last_request_at = 0.0
@@ -72,6 +83,38 @@ def _respect_rate_limit(min_interval: float) -> None:
     _last_request_at = time.monotonic()
 
 
+def _retry_after(resp: requests.Response) -> float | None:
+    """``Retry-After`` in seconds, if the server sent a usable one.
+
+    Only the delta-seconds form is honored; the HTTP-date form is rare here and
+    not worth the clock-skew risk. A server's own number beats our backoff
+    schedule, so it wins when present.
+    """
+    raw = resp.headers.get("Retry-After", "").strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return None
+    return min(max(seconds, 0.0), _BACKOFF_CAP) if seconds >= 0 else None
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Is this failure worth retrying the identical request for?
+
+    Timeouts and connection drops are transient by nature. For HTTP errors
+    only :data:`_RETRY_STATUS` qualifies: a 404 means the title/date does not
+    exist and will never exist, so retrying it just burns minutes before
+    showing the user the same error.
+    """
+    if isinstance(exc, requests.Timeout | requests.ConnectionError):
+        return True
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return exc.response.status_code in _RETRY_STATUS
+    return False
+
+
 def _looks_like_xml(head: bytes, content_type: str) -> bool:
     """Heuristic guard against 200-status error/HTML pages: the eCFR full-title
     endpoint returns an ``<?xml ...>`` document with an XML content type."""
@@ -83,43 +126,24 @@ def _looks_like_xml(head: bytes, content_type: str) -> bool:
     return "xml" in content_type.lower() and lead.startswith(b"<")
 
 
-def fetch_title_xml(
-    title: int,
-    date: str,
+class TransientFetchError(FetchError):
+    """A fetch failure that an identical retry could plausibly fix."""
+
+
+def _download_once(
+    url: str,
+    dest: Path,
     *,
-    data_dir: Path = DATA_RAW,
-    session: requests.Session | None = None,
-    user_agent: str = DEFAULT_USER_AGENT,
-    min_interval: float = DEFAULT_MIN_INTERVAL,
-    force: bool = False,
-) -> Path:
-    """Fetch the full XML for ``title`` as of ``date`` and cache it under
-    ``data_dir``. Returns the path to the cached file.
-
-    If the file is already cached (and ``force`` is False) it is returned
-    without any network request. The download is streamed to a temporary file,
-    validated as XML, then atomically moved into place, so a failed or bogus
-    response never poisons the cache.
-    """
-    date = _validate_date(date)
-    dest = cache_path(title, date, data_dir)
-
-    if dest.exists() and not force:
-        return dest
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    url = build_url(title, date)
+    session: requests.Session,
+    user_agent: str,
+    min_interval: float,
+) -> None:
+    """One streamed download attempt, committed atomically on success."""
     headers = {"User-Agent": user_agent, "Accept": "application/xml"}
-
-    owns_session = session is None
-    session = session or requests.Session()
     tmp = dest.with_name(dest.name + ".tmp")
-
     try:
         _respect_rate_limit(min_interval)
-        with session.get(
-            url, headers=headers, stream=True, timeout=_REQUEST_TIMEOUT
-        ) as resp:
+        with session.get(url, headers=headers, stream=True, timeout=_REQUEST_TIMEOUT) as resp:
             resp.raise_for_status()
             content_type = resp.headers.get("Content-Type", "")
             wrote_any = False
@@ -137,7 +161,9 @@ def fetch_title_xml(
                         wrote_any = True
                     fh.write(chunk)
             if not wrote_any:
-                raise FetchError(f"empty response body for {url}")
+                # A 200 with no body is eCFR giving up mid-render, not a real
+                # answer about this title — worth retrying.
+                raise TransientFetchError(f"empty response body for {url}")
         os.replace(tmp, dest)
     except BaseException:
         # Never leave a partial or invalid file behind in the cache.
@@ -146,11 +172,79 @@ def fetch_title_xml(
         except OSError:
             pass
         raise
+
+
+def fetch_title_xml(
+    title: int,
+    date: str,
+    *,
+    data_dir: Path = DATA_RAW,
+    session: requests.Session | None = None,
+    user_agent: str = DEFAULT_USER_AGENT,
+    min_interval: float = DEFAULT_MIN_INTERVAL,
+    force: bool = False,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    backoff: float = DEFAULT_BACKOFF,
+    sleep=time.sleep,
+) -> Path:
+    """Fetch the full XML for ``title`` as of ``date`` and cache it under
+    ``data_dir``. Returns the path to the cached file.
+
+    If the file is already cached (and ``force`` is False) it is returned
+    without any network request. The download is streamed to a temporary file,
+    validated as XML, then atomically moved into place, so a failed or bogus
+    response never poisons the cache.
+
+    Transient failures (timeouts, dropped connections, 5xx, 429 — see
+    :func:`is_transient`) are retried up to ``max_attempts`` times with
+    exponential backoff, honouring ``Retry-After`` when the server sends one.
+    Everything else fails immediately: a 404 means that title/date does not
+    exist, and retrying it only delays the error. ``sleep`` is injectable so
+    tests can exercise the backoff schedule without waiting.
+    """
+    date = _validate_date(date)
+    dest = cache_path(title, date, data_dir)
+
+    if dest.exists() and not force:
+        return dest
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    url = build_url(title, date)
+
+    owns_session = session is None
+    session = session or requests.Session()
+    try:
+        delay = backoff
+        for attempt in range(1, max(1, max_attempts) + 1):
+            try:
+                _download_once(
+                    url,
+                    dest,
+                    session=session,
+                    user_agent=user_agent,
+                    min_interval=min_interval,
+                )
+                return dest
+            except (requests.RequestException, TransientFetchError) as exc:
+                transient = isinstance(exc, TransientFetchError) or is_transient(exc)
+                if not transient or attempt >= max_attempts:
+                    raise
+                wait = delay
+                response = getattr(exc, "response", None)
+                if response is not None:
+                    wait = _retry_after(response) or delay
+                print(
+                    f"warning: {type(exc).__name__} fetching title {title} "
+                    f"(attempt {attempt}/{max_attempts}); retrying in {wait:.0f}s",
+                    file=sys.stderr,
+                )
+                sleep(wait)
+                delay = min(delay * 2, _BACKOFF_CAP)
     finally:
         if owns_session:
             session.close()
 
-    return dest
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _use_os_trust_store() -> None:
@@ -184,6 +278,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Minimum seconds between network requests",
     )
     parser.add_argument("--force", action="store_true", help="Re-download even if cached")
+    parser.add_argument(
+        "--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
+        help="Attempts before giving up on a transient failure",
+    )
+    parser.add_argument(
+        "--backoff", type=float, default=DEFAULT_BACKOFF,
+        help="Seconds before the 2nd attempt (doubles each retry)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -194,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
             user_agent=args.user_agent,
             min_interval=args.min_interval,
             force=args.force,
+            max_attempts=args.max_attempts,
+            backoff=args.backoff,
         )
     except (ValueError, FetchError, requests.RequestException) as exc:
         print(f"error: {exc}", file=sys.stderr)

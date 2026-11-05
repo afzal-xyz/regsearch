@@ -4,7 +4,7 @@
 that pile into answers:
 
 - **Diff** the latest run against the previous one (default) or against a
-  pinned baseline file, per mode (vector / bm25 / hybrid) and per question
+  pinned baseline file, per mode (vector / bm25 / hybrid / rerank) and per question
   kind (prose / citation / ...), for every metric.
 - **Gate**: any metric drop is printed as a warning; a drop bigger than the
   threshold fails the run (exit 1), so CI can block a retrieval regression.
@@ -132,6 +132,41 @@ def diff_runs(current: dict, reference: dict) -> list[Delta]:
     return deltas
 
 
+def comparable(current: dict, reference: dict) -> bool:
+    """Were both runs scored against the same question set?
+
+    Runs that were not are still worth *showing* — the new absolute numbers
+    are the point of the run — but a delta between them is not evidence of
+    anything, because the two means are over different populations. Gating on
+    such a delta trains people to pass ``--no-fail``, which is how a
+    regression gate stops working.
+
+    Runs written before fingerprinting existed have no record, so they are
+    treated as comparable: assuming the gold set was stable is the old
+    behaviour, and silently downgrading every historical comparison would be
+    a worse default than occasionally comparing across an unrecorded change.
+    """
+    a = current.get("gold_fingerprint")
+    b = reference.get("gold_fingerprint")
+    if not a or not b:
+        # No digest to compare — but a different number of scored questions is
+        # proof enough that the set changed, and failing a gate on that would
+        # be a false alarm with a known cause.
+        na, nb = current.get("n_in_corpus"), reference.get("n_in_corpus")
+        return na is None or nb is None or na == nb
+    return a.get("sha256") == b.get("sha256")
+
+
+def describe_gold_change(current: dict, reference: dict) -> str:
+    a = (current.get("gold_fingerprint") or {}).get("n", current.get("n_in_corpus"))
+    b = (reference.get("gold_fingerprint") or {}).get("n", reference.get("n_in_corpus"))
+    if a is None or b is None:
+        return "the question set changed"
+    if a == b:
+        return f"the question set changed (still {a} questions, but different ones)"
+    return f"the question set changed ({b} -> {a} questions)"
+
+
 def pick_reference(runs: list[dict], against: str) -> dict | None:
     """The run to compare the latest against: ``previous`` or a filename."""
     if against == "previous":
@@ -175,6 +210,11 @@ def print_comparison(deltas: list[Delta], threshold: float | None) -> list[Delta
 
 
 # --- HTML report ------------------------------------------------------------
+
+
+# Modes the HTML report has columns for. A run predating a mode simply has no
+# summary for it and renders "—", so adding one here is backward-compatible.
+REPORT_MODES = ("vector", "bm25", "hybrid", "rerank")
 
 
 def _sparkline(values: list[float | None], width: int = 220, height: int = 36) -> str:
@@ -243,7 +283,7 @@ def _history_section(runs: list[dict]) -> str:
     recent = runs[-30:]  # the page stays readable; the JSONs keep everything
     head = (
         "<tr><th>run</th><th>commit</th><th>questions</th>"
-        + "".join(f"<th>{m} r@10</th><th>{m} MRR</th>" for m in ("vector", "bm25", "hybrid"))
+        + "".join(f"<th>{m} r@10</th><th>{m} MRR</th>" for m in REPORT_MODES)
         + "</tr>"
     )
     body = []
@@ -253,7 +293,7 @@ def _history_section(runs: list[dict]) -> str:
             f"<td><code>{html.escape(r.get('git_commit') or '?')}</code></td>",
             f"<td>{r.get('n_in_corpus', '?')} + {r.get('n_negatives', '?')} neg</td>",
         ]
-        for mode in ("vector", "bm25", "hybrid"):
+        for mode in REPORT_MODES:
             s = r["summary"].get(mode, {})
             for metric in ("recall@10", "mrr@10"):
                 v = s.get(metric)
@@ -264,14 +304,16 @@ def _history_section(runs: list[dict]) -> str:
     charts = []
     for group in [ALL, *kinds]:
         row = f"<tr><td>{html.escape(group)}</td>"
-        for mode in ("vector", "bm25", "hybrid"):
+        for mode in REPORT_MODES:
             row += f"<td>{_sparkline(_metric_series(recent, group, mode, 'recall@10'))}</td>"
         charts.append(row + "</tr>")
     return (
         "<h2>History</h2>"
         f"<p>Last {len(recent)} of {len(runs)} runs, newest first. Trend charts plot "
         "recall@10 on a fixed 0–1 scale, oldest → newest.</p>"
-        "<table><tr><th>group</th><th>vector</th><th>bm25</th><th>hybrid</th></tr>"
+        "<table><tr><th>group</th>"
+        + "".join(f"<th>{m}</th>" for m in REPORT_MODES)
+        + "</tr>"
         + "".join(charts)
         + "</table><table>"
         + head
@@ -386,6 +428,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"compared to: {reference['_file']}  (commit {reference.get('git_commit') or '?'})")
         deltas = diff_runs(current, reference)
         regressions = print_comparison(deltas, args.threshold)
+        if regressions and comparable(current, reference) and not (
+            current.get("gold_fingerprint") and reference.get("gold_fingerprint")
+        ):
+            # Assumed comparable (see `comparable`), but say so: a run from
+            # before fingerprinting carries no record of its question set, so
+            # "regression" here could equally be a gold-set change.
+            print(
+                "\nNOTE: one of these runs predates gold-set fingerprinting, so it cannot be\n"
+                "confirmed that both were scored against the same questions. The deltas are\n"
+                "treated as real; re-run the baseline if the gold set has changed since."
+            )
+        elif regressions and not comparable(current, reference):
+            print(
+                f"\nNOTE: {describe_gold_change(current, reference)} between these two runs,\n"
+                f"so the deltas above compare means taken over different question sets.\n"
+                f"They are shown for information; the gate is not failing on them.\n"
+                f"Re-baseline by comparing the NEXT run against this one "
+                f"(`--against {current['_file']}`)."
+            )
+            regressions = []
 
     out = Path(args.report)
     out.write_text(render_report(runs, deltas, reference, args.threshold), encoding="utf-8")

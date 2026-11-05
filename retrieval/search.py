@@ -45,9 +45,14 @@ from index import store
 from index.embedder import DEFAULT_MODEL, Embedder
 from index.store import DEFAULT_DB, connect, load_bm25, tokenize
 from index.tokenizer import citation_tokens
+from retrieval import params as fusion_params
+from retrieval.params import FusionParams
 
 logger = logging.getLogger(__name__)
 
+# The constants below are the hand-tuned DEFAULTS. The live values come from
+# retrieval/params.json via retrieval.params (see that module), which
+# retrieval.tune rewrites against the current corpus and gold set.
 RRF_K = 10  # reciprocal rank fusion constant
 
 # Candidate sections pulled from each retriever before fusion.
@@ -88,6 +93,12 @@ class SearchResult:
     heading: str
     heading_path: list[str]
     text: str  # pure chunk text
+    # Set by :func:`hybrid_search` when this section's rank is a certainty
+    # rather than a similarity: the query named it outright, or its text
+    # references the cited section. Downstream re-ranking must leave these
+    # alone — see :mod:`rag.reranker`. Always False from the single-retriever
+    # entry points, which have no notion of citations.
+    pinned: bool = False
 
 
 def _load_chunk(conn: sqlite3.Connection, chunk_id: str) -> sqlite3.Row:
@@ -95,7 +106,11 @@ def _load_chunk(conn: sqlite3.Connection, chunk_id: str) -> sqlite3.Row:
 
 
 def _result(
-    conn: sqlite3.Connection, chunk_id: str, score: float, retrievers: list[str]
+    conn: sqlite3.Connection,
+    chunk_id: str,
+    score: float,
+    retrievers: list[str],
+    pinned: bool = False,
 ) -> SearchResult:
     row = _load_chunk(conn, chunk_id)
     return SearchResult(
@@ -107,6 +122,7 @@ def _result(
         heading=row["heading"],
         heading_path=json.loads(row["heading_path"]),
         text=row["text"],
+        pinned=pinned,
     )
 
 
@@ -239,6 +255,22 @@ def _citing_chunks(conn: sqlite3.Connection, tokens: frozenset[str]) -> list[tup
     return out
 
 
+def agreement(
+    vector_hits: list[SearchResult], bm25_hits: list[SearchResult], k: int, scale: float
+) -> float:
+    """Fraction in [0, 1]: top-``k`` section overlap over ``scale``, capped at 1.
+
+    ``scale`` is the overlap (as a fraction of k) at which BM25 is fully
+    trusted: with k=10 and scale=0.3, sharing 3+ sections means full trust,
+    1 section a third, none zero.
+    """
+    if k <= 0 or scale <= 0:
+        return 1.0
+    a = {r.section_citation for r in vector_hits[:k]}
+    b = {r.section_citation for r in bm25_hits[:k]}
+    return min(1.0, (len(a & b) / k) / scale)
+
+
 def _best_per_section(results: list[SearchResult]) -> list[SearchResult]:
     """Collapse a ranked chunk list to its best chunk per section, order kept.
 
@@ -255,107 +287,133 @@ def _best_per_section(results: list[SearchResult]) -> list[SearchResult]:
     return collapsed
 
 
-def hybrid_search(
+@dataclass
+class Candidates:
+    """Everything :func:`fuse` needs, fetched once per query.
+
+    Retrieval (embedding the query, the sqlite-vec KNN, BM25 over every chunk,
+    the citation lookups) is the expensive half of hybrid search and depends on
+    nothing tunable. Fusion is arithmetic over these lists. Splitting them lets
+    :mod:`retrieval.tune` fetch candidates for every gold question once and
+    then score hundreds of parameter sets in seconds, instead of re-running
+    retrieval per parameter set.
+    """
+
+    query: str
+    vector_hits: list[SearchResult]  # best chunk per section, vector order
+    bm25_chunks: list[SearchResult]  # raw chunk ranking (confidence reads its scores)
+    known: frozenset[str]  # citation tokens in the query that name indexed sections
+    citing: list[tuple[str, str]]  # (chunk_id, section) referencing cited-but-absent sections
+
+
+def retrieve_candidates(
     query: str,
-    k: int = 5,
     *,
     conn: sqlite3.Connection,
     embedder: Embedder,
-    rrf_k: int = RRF_K,
     pool: int = POOL,
-    bm25_weight: float = BM25_WEIGHT,
-) -> list[SearchResult]:
-    """Fuse vector + BM25 rankings with confidence-weighted, section-level RRF.
-
-    Each retriever contributes ``weight / (rrf_k + rank)`` per section, with
-    1-based ranks over its ``pool`` best *sections*. Vector always has weight
-    1.0; BM25 has ``bm25_weight`` scaled by :func:`bm25_confidence`, so a BM25
-    ranking that looks like noise is damped or ignored entirely and hybrid
-    falls back to pure semantic order — unless the query names a section that
-    is in the index (or referenced by indexed text, e.g. the interior of a
-    "§§ X through Y" range), in which case BM25 has a verified lexical anchor
-    and is trusted outright. A citation the index neither holds nor references
-    (a non-existent number, or another title) gets no such treatment.
-
-    Returns up to ``k`` results, one per section — the section's best-matching
-    chunk, carrying the fused score.
-    """
+) -> Candidates:
+    """Run both retrievers and the citation lookups; no fusion yet."""
     chunk_pool = pool * _POOL_OVERFETCH
     vector_hits = _best_per_section(vector_search(query, chunk_pool, conn=conn, embedder=embedder))
     bm25_chunks = bm25_search(query, chunk_pool, conn=conn)
 
     # Sections the query names that are actually in the index. A query can
     # cite a section that does not exist (§ 4.999) or lives in a title that
-    # was never ingested (31 CFR 1010.230); those are *not* a lexical anchor.
+    # was never ingested; those are *not* a lexical anchor.
     wanted = citation_tokens(query)
     known = wanted & indexed_section_tokens(conn) if wanted else frozenset()
 
     # A cited section can be absent from the index yet *referenced* by indexed
     # text — most often a section interior to a "§§ X through Y" range, whose
-    # token exists only because the analyzer expanded the range (§ 1010.615
-    # appears in no section citation, but § 1010.605's text covers it). The
-    # documents containing that token are the only possible answers to the
-    # lookup, so they are promoted below true exact matches (see `promoted`
-    # further down). A token in neither the sections nor the vocabulary
-    # (§ 4.999) still gets no special treatment.
+    # token exists only because the analyzer expanded the range. The documents
+    # containing that token are the only possible answers to the lookup, so
+    # they are promoted below true exact matches in `fuse`. A token in neither
+    # the sections nor the vocabulary (§ 4.999) still gets no special treatment.
     citing = _citing_chunks(conn, wanted - known) if wanted - known else []
+    return Candidates(query, vector_hits, bm25_chunks, known, citing)
 
-    if known or citing:
+
+def fuse(
+    cands: Candidates,
+    k: int,
+    *,
+    params: FusionParams,
+    pool: int = POOL,
+    bm25_weight: float | None = None,
+) -> list[tuple[str, str, float, list[str], bool]]:
+    """Confidence-weighted, section-level RRF over ``cands``.
+
+    Returns ``(section, chunk_id, score, retrievers, pinned)`` tuples, best
+    first, without touching the database — so the tuner can call it in a tight
+    loop. :func:`hybrid_search` turns them into :class:`SearchResult`s.
+
+    Each retriever contributes ``weight / (rrf_k + rank)`` per section, with
+    1-based ranks over its ``pool`` best *sections*. Vector always has weight
+    1.0; BM25 has ``bm25_weight`` scaled by :func:`bm25_confidence`, so a BM25
+    ranking that looks like noise is damped or ignored and hybrid falls back
+    to pure semantic order — unless the query names a section that is in the
+    index (or referenced by indexed text), in which case BM25 has a verified
+    lexical anchor and is trusted outright.
+    """
+    weight = params.bm25_weight if bm25_weight is None else bm25_weight
+    if cands.known or cands.citing:
         # bm25_confidence infers "did BM25 find a real lexical anchor" from the
         # shape of its scores, because normally there is nothing better to go
-        # on. A query that names an indexed section gives us that answer
-        # directly, and a citation is the most discriminating term there is —
-        # so do not let the heuristic veto it. Without this, a question citing
-        # a section whose score curve happens to look flat loses BM25
-        # entirely, which is exactly the ranking that knows where that section
-        # is referenced.
-        #
-        # The check against the index matters: when the cited section is
-        # absent, the citation tokens match nothing and BM25 is ranking on the
-        # question's remaining prose alone. Forcing full trust there injects
-        # an arbitrary keyword ranking at full weight — measured on the
-        # negative citation questions in eval/gold.jsonl, it pulled unrelated
-        # sections into the top 5 that the confidence gate would have damped.
+        # on. A query naming an indexed section answers that directly, and a
+        # citation is the most discriminating term there is — do not let the
+        # heuristic veto it. The check against the index matters: when the
+        # cited section is absent, BM25 is ranking the question's leftover
+        # prose, which is exactly the noise the gate exists to catch.
         confidence = 1.0
     else:
-        # Read off the raw chunk scores, before section de-duping.
-        confidence = bm25_confidence([r.score for r in bm25_chunks])
-    bm25_scaled = bm25_weight * confidence
-    bm25_hits = _best_per_section(bm25_chunks)
+        confidence = bm25_confidence(
+            [r.score for r in cands.bm25_chunks],
+            anchor=params.bm25_contrast_anchor,
+            lo=params.bm25_contrast_lo,
+            hi=params.bm25_contrast_hi,
+        )
+    bm25_hits = _best_per_section(cands.bm25_chunks)
+    if confidence > 0 and params.agreement_scale > 0 and not (cands.known or cands.citing):
+        # Score contrast says how *sure* BM25 is; it cannot say whether BM25 is
+        # sure about the right thing. On Title 1's prose BM25 was confidently
+        # wrong — its top 10 held the answer for 1 question in 9, yet it was
+        # trusted at ~40% and nudged vector's correct rank-1 down to 2 or 3.
+        # Whether the two retrievers broadly agree is an independent signal:
+        # when BM25 is actually useful its top 10 shares several sections with
+        # vector's; when it is noise, almost none.
+        confidence *= agreement(cands.vector_hits, bm25_hits, params.agreement_k,
+                                params.agreement_scale)
+    bm25_scaled = weight * confidence
 
     fused: dict[str, float] = {}
     best_chunk: dict[str, str] = {}
     retrievers: dict[str, set[str]] = {}
-    for ranked, weight in ((vector_hits, 1.0), (bm25_hits, bm25_scaled)):
-        if weight <= 0:
+    for ranked, w in ((cands.vector_hits, 1.0), (bm25_hits, bm25_scaled)):
+        if w <= 0:
             continue
         for rank, res in enumerate(ranked[:pool], start=1):
             section = res.section_citation
-            fused[section] = fused.get(section, 0.0) + weight / (rrf_k + rank)
+            fused[section] = fused.get(section, 0.0) + w / (params.rrf_k + rank)
             best_chunk.setdefault(section, res.chunk_id)
             retrievers.setdefault(section, set()).update(res.retrievers)
 
     # The cited-but-absent case: inject the sections whose text references the
-    # cited number, in citation-match order, even when neither retriever's pool
-    # surfaced them — at 6k+ chunks a single citation occurrence in a long
-    # document scores below tf-stacked common words, so BM25 alone buries the
-    # one section that governs the request.
+    # cited number, in citation-match order, even when neither pool surfaced
+    # them — at 6k+ chunks a single citation occurrence in a long document
+    # scores below tf-stacked common words.
     promoted: dict[str, int] = {}
-    for rank, (chunk_id, section) in enumerate(citing, start=1):
+    for rank, (chunk_id, section) in enumerate(cands.citing, start=1):
         if section not in promoted:
             promoted[section] = rank
             fused.setdefault(section, 0.0)
             best_chunk.setdefault(section, chunk_id)
             retrievers.setdefault(section, set()).add("bm25")
 
-    # A query that names a section ("§ 25.14", "4 CFR 25.14") is a known-item
-    # lookup, not a search: an exact citation match is certainty, and ranked
-    # similarity cannot outvote it. Without this the vector side — which has no
-    # notion of citations and returns neighbouring sections — outranks the
-    # requested section about half the time. Sections that merely *reference* a
-    # cited-but-absent number rank just below true exact matches, best citation
-    # match first. No-op for queries naming no section, or naming one that is
-    # neither in the index nor referenced by it.
+    # A query naming a section is a known-item lookup, not a search: an exact
+    # citation match is certainty, and ranked similarity cannot outvote it.
+    # Sections merely *referencing* a cited-but-absent number rank just below.
+    known = cands.known
     exact = {s for s in fused if known & citation_tokens(s)} if known else frozenset()
 
     top = sorted(
@@ -364,8 +422,45 @@ def hybrid_search(
         reverse=True,
     )[:k]
     return [
-        _result(conn, best_chunk[section], score, sorted(retrievers[section]))
+        (
+            section,
+            best_chunk[section],
+            score,
+            sorted(retrievers[section]),
+            section in exact or section in promoted,
+        )
         for section, score in top
+    ]
+
+
+def hybrid_search(
+    query: str,
+    k: int = 5,
+    *,
+    conn: sqlite3.Connection,
+    embedder: Embedder,
+    params: FusionParams | None = None,
+    pool: int = POOL,
+    bm25_weight: float | None = None,
+    rrf_k: int | None = None,
+) -> list[SearchResult]:
+    """Hybrid retrieval: :func:`retrieve_candidates` then :func:`fuse`.
+
+    ``params`` defaults to the tuned set in ``retrieval/params.json`` (or the
+    code defaults when that file is absent). ``bm25_weight`` / ``rrf_k`` are
+    per-call overrides kept for experiments and tests.
+
+    Returns up to ``k`` results, one per section — the section's best-matching
+    chunk, carrying the fused score.
+    """
+    params = params or fusion_params.current()
+    if rrf_k is not None:
+        params = params.with_(rrf_k=rrf_k)
+    cands = retrieve_candidates(query, conn=conn, embedder=embedder, pool=pool)
+    fused = fuse(cands, k, params=params, pool=pool, bm25_weight=bm25_weight)
+    return [
+        _result(conn, chunk_id, score, retrievers, pinned=pinned)
+        for _section, chunk_id, score, retrievers, pinned in fused
     ]
 
 

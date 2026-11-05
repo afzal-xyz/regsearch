@@ -24,3 +24,24 @@ jobs:
 
       - name: Test (offline only)
         run: uv run pytest -m "not slow"
+
+      # The corpus itself cannot be checked here — the index is gitignored and
+      # rebuilding it would mean downloading several titles on every push. But
+      # the manifest and the gold set are committed, and their gates need
+      # neither: schema, duplicates, per-title coverage and negative staleness
+      # are all decidable from the files alone. Those are also the checks most
+      # likely to be skipped locally, since they fail only when someone adds a
+      # title or edits the gold set.
+      - name: Validate the corpus manifest
+        run: uv run python -m pipeline.manifest
+
+      - name: Gate the gold set (schema + coverage)
+        run: uv run python -m eval.goldset --check
+
+      # retrieval/params.json records the corpus, gold-set fingerprint and
+      # analyzer it was tuned against. All three are derivable from committed
+      # files, so a mismatch here means someone changed the corpus or the gold
+      # set and did not re-run the tune stage. Fail the build rather than ship
+      # parameters calibrated for a corpus that no longer exists.
+      - name: Gate retrieval params (tuned for this corpus?)
+        run: uv run python -m retrieval.tune --check

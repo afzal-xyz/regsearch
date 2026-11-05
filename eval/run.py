@@ -17,6 +17,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import subprocess
@@ -26,6 +27,8 @@ from pathlib import Path
 
 from index.embedder import DEFAULT_MODEL, Embedder
 from index.store import DEFAULT_DB, connect
+from rag import reranker as reranker_mod
+from retrieval import params as fusion_params
 from retrieval import search
 
 logger = logging.getLogger(__name__)
@@ -53,7 +56,7 @@ def git_commit() -> str | None:
         return None
     return f"{head}-dirty" if status else head
 DEFAULT_RESULTS_DIR = Path("eval/results")
-MODES = ("vector", "bm25", "hybrid")
+MODES = ("vector", "bm25", "hybrid", "rerank")
 
 
 # --- pure metric functions (unit-tested in isolation) ----------------------
@@ -98,7 +101,16 @@ def _dedupe_sections(results: list[search.SearchResult], k: int) -> list[str]:
     return ordered
 
 
-def retrieve(mode: str, question: str, k: int, *, conn, embedder) -> list[str]:
+def retrieve(
+    mode: str,
+    question: str,
+    k: int,
+    *,
+    conn,
+    embedder,
+    reranker=None,
+    candidates: int | None = None,
+) -> list[str]:
     """Return up to ``k`` distinct section citations for ``mode``, best first."""
     pool = k * 4  # over-fetch chunks so k distinct sections survive de-duping
     if mode == "vector":
@@ -107,6 +119,13 @@ def retrieve(mode: str, question: str, k: int, *, conn, embedder) -> list[str]:
         results = search.bm25_search(question, pool, conn=conn)
     elif mode == "hybrid":
         results = search.hybrid_search(question, pool, conn=conn, embedder=embedder)
+    elif mode == "rerank":
+        # No over-fetch: rerank_search is already section-level, and widening
+        # `k` here would silently widen the candidate pool it reranks.
+        results = reranker_mod.rerank_search(
+            question, k, conn=conn, embedder=embedder,
+            reranker=reranker, candidates=candidates,
+        )
     else:
         raise ValueError(f"unknown mode {mode!r}")
     return _dedupe_sections(results, k)
@@ -128,6 +147,32 @@ def load_gold(path: Path | str) -> list[dict]:
 METRICS = ("recall@5", "recall@10", "mrr@10")
 
 
+def gold_fingerprint(gold: list[dict]) -> dict:
+    """Identify the exact question set a run was scored against.
+
+    Every metric here is a mean over a particular set of questions. Add a
+    title's questions and each mean is computed over a different population,
+    so "hybrid prose MRR fell 0.016" is not a regression — it is a different
+    measurement wearing the same name. Recording the question set lets
+    ``eval/compare.py`` tell the two apart instead of crying wolf every time
+    the gold set grows (see ``--against`` there).
+
+    The digest covers the questions and their expected answers, so rewording
+    a question or correcting its citations also counts as a change.
+    """
+    payload = json.dumps(
+        sorted(
+            (g["question"], sorted(g.get("relevant_citations") or []), g.get("kind", "prose"))
+            for g in gold
+        ),
+        ensure_ascii=False,
+    )
+    return {
+        "n": len(gold),
+        "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16],
+    }
+
+
 def _aggregate(scored: list[dict], modes) -> dict:
     """Mean of each metric per mode over ``scored`` (one entry per question)."""
     summary = {}
@@ -142,7 +187,16 @@ def _aggregate(scored: list[dict], modes) -> dict:
     return summary
 
 
-def evaluate(gold: list[dict], modes, *, conn, embedder, k: int = 10) -> dict:
+def evaluate(
+    gold: list[dict],
+    modes,
+    *,
+    conn,
+    embedder,
+    k: int = 10,
+    reranker=None,
+    candidates: int | None = None,
+) -> dict:
     in_corpus = [g for g in gold if g["relevant_citations"]]
     negatives = [g for g in gold if not g["relevant_citations"]]
 
@@ -163,7 +217,10 @@ def evaluate(gold: list[dict], modes, *, conn, embedder, k: int = 10) -> dict:
         }
         per_mode = {}
         for m in modes:
-            ranked = retrieve(m, g["question"], k, conn=conn, embedder=embedder)
+            ranked = retrieve(
+                m, g["question"], k,
+                conn=conn, embedder=embedder, reranker=reranker, candidates=candidates,
+            )
             entry["modes"][m] = {
                 "first_hit_rank": first_hit_rank(ranked, relevant),  # null for negatives/misses
                 "top_sections": ranked,
@@ -215,6 +272,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=str, default=str(DEFAULT_DB))
     parser.add_argument("--gold", type=Path, default=DEFAULT_GOLD)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--rerank-model", default=reranker_mod.DEFAULT_RERANK_MODEL)
+    parser.add_argument(
+        "--candidates", type=int, default=None,
+        help="override tuned rerank_candidates (rerank mode only)",
+    )
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     args = parser.parse_args(argv)
 
@@ -223,15 +285,21 @@ def main(argv: list[str] | None = None) -> int:
 
     # Only load the embedding model if a semantic mode is in play.
     embedder = None
-    if any(m in ("vector", "hybrid") for m in modes):
+    reranker = None
+    if any(m in ("vector", "hybrid", "rerank") for m in modes):
         from ingest import fetcher
 
         fetcher._use_os_trust_store()
         embedder = Embedder(args.model)
+    if "rerank" in modes:
+        reranker = reranker_mod.Reranker(args.rerank_model)
 
     conn = connect(args.db)
     try:
-        result = evaluate(gold, modes, conn=conn, embedder=embedder, k=args.k)
+        result = evaluate(
+            gold, modes, conn=conn, embedder=embedder, k=args.k,
+            reranker=reranker, candidates=args.candidates,
+        )
     finally:
         conn.close()
 
@@ -254,7 +322,12 @@ def main(argv: list[str] | None = None) -> int:
         "gold": str(args.gold),
         "db": args.db,
         "model": args.model,
+        "rerank_model": args.rerank_model if "rerank" in modes else None,
         "modes": modes,
+        "gold_fingerprint": gold_fingerprint(gold),
+        # The parameters this run was scored with, so a result file is
+        # reproducible after retrieval/params.json has been re-tuned.
+        "params": fusion_params.current().to_dict(),
         **result,
     }
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

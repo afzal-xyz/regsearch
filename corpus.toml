@@ -1,0 +1,28 @@
+# The declared corpus: every CFR title/date RegSearch is built from.
+#
+# This file is the single source of truth. Every pipeline stage — fetch,
+# chunk, index, integrity, gold coverage, eval — reads it and operates on
+# ALL entries, so a title cannot be half-onboarded: present in the index but
+# missing from the gold set, or chunked at one date and indexed at another.
+#
+# Add a title with `python -m pipeline.onboard --title N --date YYYY-MM-DD`,
+# which appends here and then re-runs every stage across the whole corpus.
+#
+# `date` is an eCFR issue date: the text as it stood that day. Keeping one
+# date across titles makes the corpus a coherent snapshot rather than a mix
+# of vintages.
+
+[[titles]]
+number = 4
+date = "2024-07-18"
+name = "Accounts"
+
+[[titles]]
+number = 31
+date = "2024-07-18"
+name = "Money and Finance: Treasury"
+
+[[titles]]
+number = 1
+date = "2024-07-18"
+name = "General Provisions"

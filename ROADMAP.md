@@ -10,7 +10,7 @@ What's built and what's next. Every retrieval change gets measured against
 - [x] Hierarchy-aware chunker with full citation and paragraph anchors
 - [x] Embeddings (bge-small) + sqlite-vec store + persisted BM25 index
 - [x] Hybrid retrieval with reciprocal rank fusion
-- [x] Eval harness: 61-question gold set, recall@k / MRR, per-question detail
+- [x] Eval harness: 143-question gold set, recall@k / MRR, per-question detail
 - [x] CI: ruff + offline pytest on GitHub Actions
 - [x] **Make hybrid beat vector-only.** Section-level fusion + confidence-weighted
       BM25 took recall@10 from 0.76 to 0.93, past vector-only's 0.90. See
@@ -43,17 +43,56 @@ What's built and what's next. Every retrieval change gets measured against
       trend sparklines. `eval/run.py` stamps each run with its commit and
       refreshes the page.
 
+- [x] **Cross-encoder reranker** (`rag/reranker.py`) over hybrid's top-k.
+      Hybrid found the answer in the top 10 for 93% of prose questions but
+      ranked it no better than vector-only; the reranker converts that recall
+      into rank — prose MRR 0.611 → 0.691 and recall@5 0.798 → 0.845 with
+      recall@10 unchanged. Citation lookups are pinned and never reordered.
+      Reranking *more* than k measured strictly worse, so the candidate pool
+      is 10, not the conventional 30. See "Cross-encoder reranking" in the
+      README.
+
+- [x] **Formalized title onboarding** (`pipeline/`). `corpus.toml` declares the
+      corpus; `pipeline.onboard` runs fetch → chunk → index → integrity → gold
+      → eval → regression over **all** declared titles, so a title cannot be
+      half-onboarded. Adds fetch retry with backoff (eCFR 504s on large
+      titles), an integrity gate (chunk schema/citations, index-vs-manifest
+      coverage, a retrieval self-lookup probe), a gold-set coverage gate with
+      draft scaffolding, and gold-set fingerprinting so the regression gate
+      does not fire on a changed question set. Validated by onboarding Title 1.
+- [x] Corpus grown to Titles 1, 4 and 31 (6,564 chunks, 143 gold questions).
+- [x] **Parameter tuning as a pipeline stage** (`retrieval/tune.py`,
+      `retrieval/params.json`). Fusion and rerank constants carry provenance;
+      the integrity gate warns when it goes stale; the `tune` stage grid-searches
+      with 5-fold cross-validation and adopts only a gain beyond 1/n. First
+      run: declined to change anything — the in-sample "win" was two questions
+      worse held out. Adds a `preflight` stage. See "Parameters are re-tuned,
+      honestly" in the README.
+
+- [x] **Larger reranker.** `bge-reranker-base` replaces MiniLM-L-6 as the
+      default: prose MRR 0.664 → 0.696 and recall@5 0.837 → 0.867 on identical
+      candidates, at 5× the per-query latency on CPU. The reranker is now part
+      of the tuning provenance, so swapping it forces a re-tune.
+- [x] **CI gate on parameter staleness** (`retrieval.tune --check`): a title
+      or gold-set change cannot merge without a matching `params.json`.
+
 ## Next: retrieval quality
 
-- [ ] Cross-encoder reranker (`rag/`) over the fused top-k
-- [ ] **Re-tune the BM25 confidence thresholds on a larger gold set.** They sit
-      on a wide plateau on Title 4, but 54 answerable questions over one small
-      title is thin evidence that the chosen contrast band transfers. They are
-      calibrated per `ANALYZER_VERSION` and must be re-checked with it.
+- [ ] **Latency budget.** 8 s/query on CPU is fine for eval and batch, not for
+      an interactive API. Decide GPU vs the small reranker vs a two-stage
+      rerank (MiniLM over 30, bge over the top 10) once the API exists.
+- [ ] **A better BM25 gate signal.** Score contrast barely separates "BM25
+      found it" from "BM25 missed" (0.55 vs 0.44 mean confidence); a
+      retriever-agreement factor is implemented as a tunable
+      (`agreement_scale`) but did not win cross-validated. Candidates: query
+      length / IDF mass, or a tiny learned gate once the gold set is larger.
+      This is what would lift hybrid's Title 1 prose MRR; tuning cannot.
 - [ ] Revisit stemming once the gold set is larger — Porter2 edged out the
       conservative S-stemmer by one question, but conflates applicant/applicable
       and administrator/administrative (see the README)
-- [ ] Grow the gold set beyond Title 4 and add harder paraphrase and prose negative questions
+- [ ] Grow the gold set with harder paraphrase and prose negative questions
+- [ ] Raise the per-title gold floor from 12/4/2 toward the 42/12 the first two
+      titles carry, as authoring capacity allows
 
 ## Next: answers
 

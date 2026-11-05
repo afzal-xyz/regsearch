@@ -132,3 +132,29 @@ def test_retrieve_returns_distinct_sections(index):
     conn, emb = index
     sections = run.retrieve("bm25", "employee", 10, conn=conn, embedder=emb)
     assert len(sections) == len(set(sections))
+
+
+def test_retrieve_rerank_mode(index):
+    """The rerank mode is wired through the harness and honours the fake reranker."""
+    from tests.test_reranker import FakeReranker
+
+    conn, emb = index
+    reranker = FakeReranker()
+    sections = run.retrieve(
+        "rerank", "financial disclosure", 5, conn=conn, embedder=emb, reranker=reranker
+    )
+    assert sections and len(sections) == len(set(sections))
+    assert reranker.calls, "the cross-encoder was never consulted"
+
+
+def test_evaluate_scores_rerank_mode(index):
+    from tests.test_reranker import FakeReranker
+
+    conn, emb = index
+    result = run.evaluate(
+        GOLD, ["hybrid", "rerank"], conn=conn, embedder=emb, k=10, reranker=FakeReranker()
+    )
+    assert set(result["summary"]) == {"hybrid", "rerank"}
+    assert result["summary"]["rerank"]["n"] == 2
+    for entry in result["details"]:
+        assert "rerank" in entry["modes"]

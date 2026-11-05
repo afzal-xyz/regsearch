@@ -133,3 +133,68 @@ class TestLoadAndPick:
 
     def test_write_report_with_no_runs(self, tmp_path):
         assert compare.write_report(results_dir=tmp_path, out=tmp_path / "r.html") is None
+
+
+# --- gold-set change detection ---------------------------------------------
+
+
+def _run(sha, n=10, **kw):
+    return {"gold_fingerprint": {"sha256": sha, "n": n}, **kw}
+
+
+def test_runs_with_the_same_question_set_are_comparable():
+    assert compare.comparable(_run("abc"), _run("abc"))
+
+
+def test_runs_with_a_different_question_set_are_not():
+    assert not compare.comparable(_run("abc", 20), _run("def", 10))
+
+
+def test_runs_without_a_fingerprint_are_assumed_comparable():
+    """Historical runs predate fingerprinting; don't silently void them."""
+    assert compare.comparable({}, _run("abc"))
+    assert compare.comparable(_run("abc"), {})
+
+
+def test_describe_gold_change_reports_counts():
+    msg = compare.describe_gold_change(_run("abc", 127), _run("def", 108))
+    assert "108 -> 127" in msg
+
+
+def test_describe_gold_change_handles_same_size_different_questions():
+    msg = compare.describe_gold_change(_run("abc", 50), _run("def", 50))
+    assert "still 50" in msg
+
+
+def test_fingerprint_is_stable_and_order_independent():
+    from eval.run import gold_fingerprint
+
+    a = [
+        {"question": "q1", "relevant_citations": ["4 CFR § 1.1"], "kind": "prose"},
+        {"question": "q2", "relevant_citations": [], "kind": "citation"},
+    ]
+    assert gold_fingerprint(a) == gold_fingerprint(list(reversed(a)))
+    assert gold_fingerprint(a)["n"] == 2
+
+
+def test_fingerprint_changes_when_a_question_is_reworded():
+    from eval.run import gold_fingerprint
+
+    a = [{"question": "q1", "relevant_citations": ["4 CFR § 1.1"]}]
+    b = [{"question": "q1 reworded", "relevant_citations": ["4 CFR § 1.1"]}]
+    assert gold_fingerprint(a)["sha256"] != gold_fingerprint(b)["sha256"]
+
+
+def test_fingerprint_changes_when_citations_are_corrected():
+    from eval.run import gold_fingerprint
+
+    a = [{"question": "q1", "relevant_citations": ["4 CFR § 1.1"]}]
+    b = [{"question": "q1", "relevant_citations": ["4 CFR § 1.2"]}]
+    assert gold_fingerprint(a)["sha256"] != gold_fingerprint(b)["sha256"]
+
+
+def test_missing_fingerprint_but_different_question_count_is_not_comparable():
+    """Pre-fingerprint run vs a run after the gold set grew: n alone proves it."""
+    assert not compare.comparable({"n_in_corpus": 127}, {"n_in_corpus": 120})
+    assert compare.comparable({"n_in_corpus": 120}, {"n_in_corpus": 120})
+    assert "120 -> 127" in compare.describe_gold_change({"n_in_corpus": 127}, {"n_in_corpus": 120})

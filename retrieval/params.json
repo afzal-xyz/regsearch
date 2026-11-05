@@ -1,0 +1,26 @@
+{
+  "params": {
+    "rrf_k": 10,
+    "bm25_weight": 1.0,
+    "bm25_contrast_anchor": 20,
+    "bm25_contrast_lo": 1.4,
+    "bm25_contrast_hi": 2.2,
+    "agreement_scale": 0.5,
+    "agreement_k": 10,
+    "rerank_candidates": 12
+  },
+  "provenance": {
+    "corpus": [
+      "1@2024-07-18",
+      "4@2024-07-18",
+      "31@2024-07-18"
+    ],
+    "gold_sha256": "a8d2c0445db4f3d1",
+    "gold_n": 143,
+    "analyzer_version": 5,
+    "tuned_at": "2026-11-04 11:57:58",
+    "objective": 0.8508,
+    "note": "adopted: cross-validated gain +0.0104 exceeds the noise margin 0.0079 (1/n)",
+    "rerank_model": "BAAI/bge-reranker-base"
+  }
+}
