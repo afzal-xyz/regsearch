@@ -1,0 +1,128 @@
+{% if error %}
+  <div class="banner bad">{{ error }}</div>
+{% elif not evaluation %}
+  <p class="muted">Move a slider to score a parameter set.</p>
+{% else %}
+
+<div class="banner {{ 'warn' if evaluation.verdict == 'better-in-sample' else '' }}">
+  <strong>In-sample · not adopted.</strong>
+  Scored on the <em>explore split</em> ({{ evaluation.metrics.n }} questions) in
+  <code>{{ evaluation.mode }}</code> mode, against production parameters.
+</div>
+
+<table>
+  <thead><tr>
+    <th>metric</th>
+    <th class="num">production</th>
+    <th class="num">this setting</th>
+    <th class="num">change</th>
+  </tr></thead>
+  <tbody>
+    {% set rows = [
+      ("objective (½·recall@10 + ½·MRR@10)", evaluation.baseline.objective,
+       evaluation.metrics.objective),
+      ("recall@5", evaluation.baseline.recall5, evaluation.metrics.recall5),
+      ("recall@10", evaluation.baseline.recall10, evaluation.metrics.recall10),
+      ("MRR@10", evaluation.baseline.mrr10, evaluation.metrics.mrr10),
+    ] %}
+    {% for label, before, after in rows %}
+      <tr>
+        <td>{{ label }}</td>
+        <td class="num">{{ fmt(before, 4) }}</td>
+        <td class="num"><strong>{{ fmt(after, 4) }}</strong></td>
+        <td class="num {{ 'up' if after > before else ('down' if after < before else '') }}">
+          {{ fmt_delta(after - before) }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="banner {{ {'better-in-sample': 'warn', 'worse': 'bad'}.get(evaluation.verdict, '') }}">
+  <strong>{{ evaluation.verdict }}</strong> — {{ evaluation.reading }}
+</div>
+
+{% if evaluation.inert %}
+  <div class="banner tiny">
+    These parameters differ from production but <strong>no gold answer changed rank</strong>,
+    so every metric is identical. The ranking did change — just not where the correct
+    sections sit. A slider that looks stuck is usually this, not a bug.
+  </div>
+{% endif %}
+
+<h3>By question kind</h3>
+<table>
+  <thead><tr><th>kind</th><th class="num">recall@5</th><th class="num">recall@10</th>
+    <th class="num">MRR@10</th><th class="num">n</th></tr></thead>
+  <tbody>
+    {% for kind, values in evaluation.metrics.by_kind.items() %}
+      <tr>
+        <td class="mono">{{ kind }}</td>
+        <td class="num">{{ fmt(values["recall@5"]) }}</td>
+        <td class="num">{{ fmt(values["recall@10"]) }}</td>
+        <td class="num">{{ fmt(values["mrr@10"]) }}</td>
+        <td class="num">{{ values["n"] }}</td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% if evaluation.moved %}
+  <h3>Questions that moved ({{ evaluation.moved | length }})</h3>
+  <table>
+    <thead><tr><th>movement</th><th>question</th>
+      <th class="num">production</th><th class="num">this setting</th></tr></thead>
+    <tbody>
+      {% for m in evaluation.moved[:25] %}
+        <tr>
+          <td class="{{ 'regression' if m.direction in ('broken', 'worse') else 'up' }}">
+            {{ m.direction }}</td>
+          <td class="q">{{ m.question }}</td>
+          <td class="num">{{ m.before if m.before is not none else "—" }}</td>
+          <td class="num">{{ m.after if m.after is not none else "—" }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="tiny muted">A mean is an average of these. If only one or two moved, the
+    change you are looking at is one or two questions.</p>
+{% endif %}
+
+{# ---- the governance block ---- #}
+<section class="governance">
+  <h3>Before you believe this</h3>
+  <ul>
+    <li><strong>{{ probes }}</strong> parameter set{{ "" if probes == 1 else "s" }} evaluated
+      in this session. The best of {{ probes }} draw{{ "" if probes == 1 else "s" }} beats the
+      average by chance alone; that is what the noise margin is for.</li>
+    <li>The held-out fold has been looked at <strong>{{ holdout_peeks }}</strong> time{{ ""
+      if holdout_peeks == 1 else "s" }}. A holdout you consult after every slider move is
+      just a second training set.</li>
+    <li>This page cannot change production. Adopting means running the tuner, which
+      chooses parameters on one fold, scores them on another, and keeps the current values
+      unless the held-out gain beats 1/n.</li>
+  </ul>
+
+  <div class="controls">
+    <button type="button"
+            hx-post="/sandbox/holdout"
+            hx-include="#sliders"
+            hx-target="#holdout"
+            hx-swap="innerHTML"
+            hx-confirm="Spend a look at the held-out fold? Every peek makes it a little less held out.">
+      Check the held-out fold
+    </button>
+    <form method="post" action="/jobs/tune">
+      <input type="hidden" name="dry_run" value="1">
+      <button type="submit" class="primary" {% if active_job %}disabled{% endif %}>
+        Run the real tuner (cross-validated)</button>
+    </form>
+  </div>
+  <div id="holdout"></div>
+
+  {% if params_staleness %}
+    <div class="banner warn tiny">Production parameters are themselves stale
+      ({{ params_staleness | join("; ") }}), so the baseline above is not what a fresh tune
+      would produce.</div>
+  {% endif %}
+</section>
+{% endif %}

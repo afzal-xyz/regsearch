@@ -1,0 +1,9 @@
+{% if not section.found %}
+  <p class="muted">That section is not in the index.</p>
+{% else %}
+  <div class="banner warn tiny">
+    You have opened the text. The overlap meter will now be working against words you have
+    just read — aim for amber, and prefer the phrasing you would have used before.
+  </div>
+  <pre class="section-body">{{ section.body }}</pre>
+{% endif %}

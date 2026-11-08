@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Gold-set authoring{% endblock %}
+
+{% block body %}
+<h1>Gold-set authoring</h1>
+<p class="muted">A title is not onboarded until the gold set covers it:
+  {{ min_prose }} prose questions, {{ min_citation }} citation lookups, and
+  {{ min_negatives }} negatives across the corpus.</p>
+
+{% if not index_ready %}
+  <div class="banner bad">
+    No index at <code>data/index/regsearch.db</code>. Drafts can be scaffolded only from an
+    indexed title, and nothing can be promoted without one: a citation that cannot be
+    verified is a question that can never be answered correctly.
+  </div>
+{% endif %}
+
+<table>
+  <thead><tr>
+    <th>title</th>
+    <th class="num">approved prose</th>
+    <th class="num">approved citation</th>
+    <th>draft queue</th>
+    <th></th>
+  </tr></thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td><a href="/authoring/{{ row.spec.number }}">{{ row.spec.label }}</a>
+        <span class="muted">@ {{ row.spec.date }}</span></td>
+      <td class="num {{ 'regression' if row.prose < min_prose else 'up' }}">
+        {{ row.prose }} / {{ min_prose }}</td>
+      <td class="num {{ 'regression' if row.citation < min_citation else 'up' }}">
+        {{ row.citation }} / {{ min_citation }}</td>
+      <td>
+        {% if row.has_draft %}
+          {{ row.draft_total }} entries · {{ row.draft_written }} written ·
+          <strong>{{ row.draft_approved }} approved</strong>
+        {% else %}
+          <span class="muted">none</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if row.has_draft %}
+          <a class="btn" href="/authoring/{{ row.spec.number }}">open</a>
+        {% else %}
+          <form method="post" action="/authoring/{{ row.spec.number }}/scaffold">
+            <button type="submit" {% if not index_ready %}disabled{% endif %}>scaffold draft</button>
+          </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<p class="muted">Corpus-wide negatives approved: {{ negatives }} (floor {{ min_negatives }}).</p>
+
+<h2>How to write one</h2>
+<p class="muted">Read the citation and heading. Ask the question the way someone who has never
+  read the regulation would ask it. Open "Reveal text" only when the heading is not enough —
+  and expect the overlap meter to go amber when you do, because the words will be fresh in
+  your mind. There is no "test this question" button, and that is deliberate: a question
+  tuned until the current engine answers it measures the engine, not the regulation.</p>
+{% endblock %}

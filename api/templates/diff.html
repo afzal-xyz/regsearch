@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Diff {{ meta.timestamp }}{% endblock %}
+
+{% block body %}
+<h1>{{ meta.timestamp }} vs {{ reference.timestamp if reference else "—" }}</h1>
+
+{% if not reference %}
+  <div class="banner">No earlier run to compare against.</div>
+{% else %}
+  {% if comparison.note %}<div class="banner warn">{{ comparison.note }}</div>{% endif %}
+
+  <section>
+    <h2>Metric deltas</h2>
+    {% for group in comparison.groups %}
+      {% set rows = comparison.rows(group) %}
+      <h3>{{ group }} (n = {{ rows[0].n if rows else 0 }})</h3>
+      <table>
+        <thead><tr><th>mode</th><th>metric</th>
+          <th class="num">before</th><th class="num">after</th>
+          <th class="num">change</th><th></th></tr></thead>
+        <tbody>
+        {% for d in rows %}
+          <tr>
+            <td class="mono">{{ d.mode }}</td>
+            <td class="mono">{{ d.metric }}</td>
+            <td class="num">{{ fmt(d.before) }}</td>
+            <td class="num">{{ fmt(d.after) }}</td>
+            <td class="num {% if d.change and d.change > 0 %}up{% elif d.is_drop %}down{% endif %}">
+              {{ fmt_delta(d.change) }}</td>
+            <td>{% if d.is_regression(comparison.threshold) and comparison.comparable %}
+              <span class="regression">✗ regression</span>{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endfor %}
+  </section>
+
+  <section>
+    <h2>Questions that moved</h2>
+    <div class="controls">
+      {% for m in modes %}
+        <a class="btn" href="/runs/{{ meta.file }}/diff?mode={{ m }}">{{ m }}{% if m == mode %} ✓{% endif %}</a>
+      {% endfor %}
+    </div>
+    {% if not moved %}
+      <p class="muted">No question changed rank in <code>{{ mode }}</code>.</p>
+    {% else %}
+      <table>
+        <thead><tr><th>movement</th><th>question</th><th>kind</th>
+          <th class="num">before</th><th class="num">after</th></tr></thead>
+        <tbody>
+          {% for d in moved %}
+          <tr>
+            <td class="{{ 'regression' if d.movement in ('broken', 'worse') else 'up' }}">
+              {{ d.movement }}</td>
+            <td class="q">{{ d.question }}</td>
+            <td class="muted">{{ d.kind }}</td>
+            <td class="num">{{ d.before if d.before is not none else "—" }}</td>
+            <td class="num">{{ d.after if d.after is not none else "—" }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="muted">Questions absent from either run are skipped: a question that did not
+        exist before has not moved.</p>
+    {% endif %}
+  </section>
+{% endif %}
+
+<p><a class="btn" href="/runs/{{ meta.file }}">back to the run</a></p>
+{% endblock %}

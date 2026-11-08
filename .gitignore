@@ -48,3 +48,9 @@ model_*.txt
 
 # Eval report page (regenerated from eval/results/)
 eval/report.html
+
+# Advisory lock files created by the authoring UI (api/authoring.gold_lock)
+eval/*.jsonl.lock
+
+# Sandbox prescore cache (derived; rebuild with `python -m retrieval.prescore`)
+data/sandbox/

@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Authoring — {{ spec.label }}{% endblock %}
+
+{% block body %}
+<h1>{{ spec.label }} <span class="muted">@ {{ spec.date }}</span></h1>
+<p class="muted"><a href="/authoring">all titles</a> ·
+  drafts live in <code>eval/gold_title{{ title }}_draft.jsonl</code> and nothing reaches
+  <code>eval/gold.jsonl</code> until “Approve &amp; merge” validates them.</p>
+
+{% if not index_ready %}
+  <div class="banner bad">No index built, so citations cannot be verified and nothing can
+    be promoted.</div>
+{% endif %}
+
+{% if staleness %}
+  <div class="banner warn">
+    <strong>Parameters are already stale.</strong>
+    {% for reason in staleness %}<div>{{ reason }}</div>{% endfor %}
+    Merging more questions will not make this worse, but
+    <code>uv run python -m retrieval.tune</code> is owed before the next eval is comparable.
+  </div>
+{% endif %}
+
+{% if file_problems %}
+  <div class="banner warn">
+    <strong>This draft file needed repair to be readable.</strong>
+    The file on disk is untouched — the fixes below are in memory only, and reach disk
+    when you save a row.
+    <ul>{% for problem in file_problems %}<li class="mono tiny">{{ problem }}</li>{% endfor %}</ul>
+    {% if skipped_lines %}
+      <div>{{ skipped_lines }} line(s) could not be read at all and are not shown.</div>
+    {% endif %}
+  </div>
+{% endif %}
+
+{% if unverified %}
+  <div class="banner bad">
+    <strong>{{ unverified | length }} entry(s) cite a section that is not in the index.</strong>
+    The overlap meter cannot check them and they cannot be approved — a blank meter on
+    those rows means “not checked”, never “clean”.
+  </div>
+{% endif %}
+
+{% if not has_draft %}
+  <div class="banner">
+    No draft queue yet.
+    <form method="post" action="/authoring/{{ title }}/scaffold">
+      <button type="submit" {% if not index_ready %}disabled{% endif %}>
+        Scaffold a draft queue</button>
+    </form>
+  </div>
+{% else %}
+
+  <div class="controls">
+    <form method="post" action="/authoring/{{ title }}/new">
+      <button type="submit">Add a blank entry</button>
+    </form>
+    <form method="post" action="/authoring/{{ title }}/promote">
+      <button type="submit" class="primary">Approve &amp; merge into gold.jsonl</button>
+    </form>
+    <span class="muted">
+      {{ items | selectattr("entry.status", "equalto", "approved") | list | length }}
+      of {{ items | length }} marked approved
+    </span>
+  </div>
+
+  <p class="muted">Only entries marked <code>approved</code> are merged, and the merge is
+    all-or-nothing: if any one of them fails validation, nothing is written.</p>
+
+  {% for item in items %}
+    {% include "partials/draft_row.html" %}
+  {% endfor %}
+{% endif %}
+{% endblock %}

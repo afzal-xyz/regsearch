@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Parameter sandbox{% endblock %}
+
+{% block body %}
+<h1>Parameter sandbox</h1>
+<p class="muted">Move a slider, see the gold set re-rank. Every number on this page is
+  <strong>in-sample and not adopted</strong>. Nothing here can write
+  <code>retrieval/params.json</code> — only <code>retrieval.tune</code> does that, because
+  only it cross-validates.</p>
+
+{% if not loaded %}
+  <div class="banner bad">
+    <strong>No prescore cache.</strong> {{ error }}
+    <p>The sandbox scores from a frozen snapshot of retrieval: candidates fetched once per
+      question and every cross-encoder score the grid could ask for. Building it loads the
+      models once, in a subprocess, so the dashboard never has to.</p>
+    <form method="post" action="/jobs/warm">
+      <button type="submit" {% if active_job %}disabled{% endif %}>Warm the cache</button>
+    </form>
+    <p class="tiny muted">Add <code>no_rerank=1</code> for a fusion-only cache that warms in
+      seconds but cannot show rerank mode.</p>
+  </div>
+{% else %}
+
+  <div class="banner {{ 'warn' if cache_staleness else 'good' }}">
+    Cache warmed {{ warmed_at }} · {{ covered }} fusion points covered.
+    {% if cache_staleness %}
+      <strong>It no longer describes the live setup:</strong>
+      <ul>{% for reason in cache_staleness %}<li>{{ reason }}</li>{% endfor %}</ul>
+      Re-warm before trusting anything below.
+      <form method="post" action="/jobs/warm">
+        <button type="submit" {% if active_job %}disabled{% endif %}>Re-warm</button>
+      </form>
+    {% else %}
+      Matches the live corpus, gold set, analyzer and reranker.
+    {% endif %}
+  </div>
+
+  <form id="sliders"
+        hx-post="/sandbox/evaluate"
+        hx-trigger="change, input delay:150ms"
+        hx-target="#result"
+        hx-swap="innerHTML">
+
+    <section>
+      <h2>Parameters</h2>
+      <div class="controls">
+        <label class="inline">Mode
+          <select name="mode">
+            <option value="rerank">rerank (hybrid → cross-encoder)</option>
+            <option value="hybrid">hybrid (fusion only)</option>
+          </select>
+        </label>
+        <span class="muted tiny">Hybrid needs no cross-encoder scores at all; rerank reads
+          them from the cache.</span>
+      </div>
+
+      {% for axis in axes %}
+        {% set current = axis_value_of(axis, position) %}
+        {% set production = axis_value_of(axis, base) %}
+        <div class="slider">
+          <label for="ax-{{ axis.name }}">
+            {{ axis.label }}
+            <span class="pill" id="val-{{ axis.name }}">{{ axis_key(current) }}</span>
+            {% if current != production %}
+              <span class="pill warn-pill">production: {{ axis_key(production) }}</span>
+            {% endif %}
+          </label>
+          <input type="range" id="ax-{{ axis.name }}"
+                 min="0" max="{{ axis.values | length - 1 }}" step="1"
+                 value="{{ axis.index_of(current) }}"
+                 data-name="{{ axis.name }}"
+                 data-values="{{ axis.keys | join('|') }}"
+                 oninput="syncAxis(this)">
+          <input type="hidden" name="{{ axis.name }}" id="hidden-{{ axis.name }}"
+                 value="{{ axis_key(current) }}">
+          <div class="tiny muted">{{ axis.help }}
+            <em>Positions: {{ axis.keys | join(', ') }}</em></div>
+        </div>
+      {% endfor %}
+
+      <p class="tiny muted">The sliders are discrete and span exactly
+        <code>retrieval.tune.GRID</code> — the tuner's own search space. A point you can
+        reach here is a point the tuner will also consider, so anything you find is a claim
+        the tuner can check. Widening the space means editing <code>GRID</code>, which goes
+        through review.</p>
+    </section>
+  </form>
+
+  <section>
+    <h2>Result</h2>
+    <div id="result">{% include "partials/sandbox_result.html" %}</div>
+  </section>
+
+  <script>
+    // Slider positions are indices into the axis; the hidden field carries the
+    // actual value so the server never has to guess what index 3 meant.
+    function syncAxis(range) {
+      var values = range.dataset.values.split("|");
+      var value = values[range.value];
+      document.getElementById("hidden-" + range.dataset.name).value = value;
+      document.getElementById("val-" + range.dataset.name).textContent = value;
+    }
+  </script>
+{% endif %}
+{% endblock %}

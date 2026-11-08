@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Run {{ meta.timestamp }}{% endblock %}
+
+{% block body %}
+<h1>Run {{ meta.timestamp }}</h1>
+<p class="muted">
+  commit <code>{{ meta.git_commit or "?" }}</code> ·
+  modes {{ meta.modes | join(", ") }} · k={{ meta.k }} ·
+  {{ meta.n_in_corpus }} in-corpus + {{ meta.n_negatives }} negatives ·
+  gold digest <code>{{ meta.gold_sha256 or "—" }}</code>
+</p>
+
+<section>
+  <h2>Summary</h2>
+  <p class="muted">Prose and citation lookups are reported separately on purpose: they are
+    different tasks with very different difficulty, and one blended mean hides movement in
+    both.</p>
+  {% for group in groups %}
+    {% set table = summaries[group] %}
+    <h3>{{ group }}</h3>
+    <table>
+      <thead><tr>
+        <th>mode</th>
+        {% for metric in METRICS %}<th class="num">{{ metric }}</th>{% endfor %}
+        <th class="num">n</th>
+      </tr></thead>
+      <tbody>
+        {% for mode, values in table.items() %}
+        <tr>
+          <td class="mono">{{ mode }}</td>
+          {% for metric in METRICS %}<td class="num">{{ fmt(values.get(metric)) }}</td>{% endfor %}
+          <td class="num">{{ values.get("n", "—") }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endfor %}
+</section>
+
+<section>
+  <h2>Per-question rank matrix</h2>
+  <p class="muted">Rank of the first correct section in each mode. Worst questions first —
+    this is where a mean comes from.</p>
+  <div class="legend">
+    <span><span class="cell top5">1</span> in the top 5</span>
+    <span><span class="cell top10">7</span> found, ranked 6–10</span>
+    <span><span class="cell miss">—</span> not retrieved</span>
+    <span><span class="cell negative">n/a</span> negative: no correct answer exists</span>
+  </div>
+  <p class="muted">A negative has no relevant citation, so it has no rank in any mode — the
+    blank is a property of the question, not a result. Whether the system correctly declined
+    to answer is the answer layer's job to check, and that layer is not built yet.</p>
+
+  <div class="controls">
+    <a class="btn" href="/runs/{{ meta.file }}">all kinds</a>
+    {% for k in kinds %}
+      <a class="btn" href="/runs/{{ meta.file }}?kind={{ k }}{% if problems %}&problems=1{% endif %}">{{ k }}</a>
+    {% endfor %}
+    <a class="btn" href="/runs/{{ meta.file }}?{% if kind %}kind={{ kind }}&{% endif %}problems={{ 0 if problems else 1 }}">
+      {{ "show all questions" if problems else "only misses and 6–10" }}
+    </a>
+    <a class="btn" href="/runs/{{ meta.file }}/diff">compare with another run</a>
+  </div>
+  <p class="muted">{{ matrix | length }} of {{ n_total }} questions shown</p>
+
+  <table>
+    <thead><tr>
+      <th>question</th><th>kind</th><th>expected</th>
+      {% for mode in modes %}<th class="num">{{ mode }}</th>{% endfor %}
+    </tr></thead>
+    <tbody>
+      {% for row in matrix %}
+      <tr>
+        <td class="q">{{ row.question }}</td>
+        <td class="muted">{{ row.kind }}</td>
+        <td class="mono">{{ row.citations | join(", ") or "— (negative)" }}</td>
+        {% for mode in modes %}
+          <td class="num">
+            <span class="cell {{ row.states[mode] }}" title="{{ row.top[mode] | join(' | ') }}">
+              {% if row.states[mode] == "negative" %}n/a
+              {% elif row.ranks[mode] is none %}—
+              {% else %}{{ row.ranks[mode] }}{% endif %}
+            </span>
+          </td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

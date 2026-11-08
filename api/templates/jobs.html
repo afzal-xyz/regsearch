@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Jobs{% endblock %}
+
+{% block body %}
+<h1>Jobs</h1>
+<p class="muted">Subprocesses started from this dashboard, newest first. History is
+  in-memory: restarting the server forgets it, but the result files and
+  <code>retrieval/params.json</code> the jobs wrote survive.</p>
+<div hx-get="/jobs" hx-trigger="load, every 3s" hx-swap="innerHTML">
+  {% include "partials/jobs.html" %}
+</div>
+{% endblock %}

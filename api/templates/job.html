@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Job {{ job.kind }}{% endblock %}
+
+{% block body %}
+<h1>{{ job.kind }} <span class="pill {{ job.status }}" id="status">{{ job.status }}</span></h1>
+<p class="mono">{{ job.command }}</p>
+<p class="muted">started {{ job.started_at }}
+  {% if job.finished_at %}· finished {{ job.finished_at }} · rc={{ job.returncode }}{% endif %}
+</p>
+
+{% if job.running %}
+  <form method="post" action="/jobs/{{ job.id }}/cancel">
+    <button type="submit">Cancel</button>
+  </form>
+{% endif %}
+
+<pre class="log" id="log">{% for line in lines %}{{ line }}
+{% endfor %}</pre>
+
+{% if job.running %}
+<script>
+  // Plain EventSource rather than an htmx extension: one less vendored asset,
+  // and resumable — the server replays from the cursor in Last-Event-ID.
+  (function () {
+    var log = document.getElementById("log");
+    var status = document.getElementById("status");
+    var src = new EventSource("/jobs/{{ job.id }}/stream?after={{ job.total_lines }}");
+    src.onmessage = function (e) {
+      var atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+      log.appendChild(document.createTextNode(e.data + "\n"));
+      if (atBottom) { log.scrollTop = log.scrollHeight; }
+    };
+    src.addEventListener("done", function (e) {
+      status.textContent = e.data;
+      src.close();
+      setTimeout(function () { location.reload(); }, 500);
+    });
+  })();
+</script>
+{% endif %}
+
+<p><a class="btn" href="/">back to the dashboard</a></p>
+{% endblock %}

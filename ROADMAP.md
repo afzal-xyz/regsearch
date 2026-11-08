@@ -76,6 +76,70 @@ What's built and what's next. Every retrieval change gets measured against
 - [x] **CI gate on parameter staleness** (`retrieval.tune --check`): a title
       or gold-set change cannot merge without a matching `params.json`.
 
+- [x] **Eval dashboard, phase 0–1** (`api/`). A FastAPI + htmx page over the
+      existing record: run history, `compare.diff_runs` deltas with the same
+      adaptive gate CI uses, and a per-question rank matrix showing where each
+      gold question landed in each mode — the view that says *why* a mean
+      moved. Heavy work is never in the web process: `api/jobs.py` shells out
+      to the same `python -m ...` commands CI runs, one at a time, streaming
+      stdout over SSE. Only allowlisted commands with validated options can
+      start, and nothing imports torch. Read-only over the benchmark: no
+      `/search`, no gold editing, no params write.
+
+## Next: the dashboard
+
+- [x] **Phase 2: gold-set authoring** (`api/authoring.py`). Citation, heading
+      and hierarchy breadcrumb by default; the section body is fetched only
+      when "Reveal text" is pressed, so collapsed is a property of the payload
+      rather than of a CSS rule, and the reveal is recorded on the entry. A
+      **lexical overlap meter** scores the typed question against the section
+      using the BM25 analyzer, weighted by how rare each shared term is across
+      the corpus — sharing "employee" is harmless, sharing "preference
+      eligible" is the author copying a term of art. A prose question naming
+      its own section is red outright. Edits write only to
+      `eval/gold_titleNN_draft.jsonl`; "Approve & merge" validates via
+      `goldset.validate()` against the live `chunks` table, is all-or-nothing,
+      replaces `gold.jsonl` by atomic rename under a lock, and is re-runnable
+      without duplicating. Pre-existing problems in the gold file are reported
+      but do not block new work. The re-tune banner is derived from the files,
+      never stored.
+
+      Meter thresholds are **provisional**: `python -m api.authoring
+      --calibrate` scores the 143 already-approved prose questions and prints
+      the distribution to set them from, but it needs a built index, which
+      this worktree does not have.
+- [x] **Phase 3: parameter sandbox** (`retrieval/prescore.py`, `api/sandbox.py`).
+      A warm job runs `tune._collect()` / `tune._prescore()` in a subprocess and
+      freezes the result to `data/sandbox/prescore.json.gz`: per question, the
+      candidate lists reduced to the four fields `fuse` reads, plus every
+      cross-encoder score the grid could ask for. Chunk text is dropped, so a
+      reader of the cache can rank and cannot retrieve or rerank. The web
+      process loads it and calls the tuner's own `tune.score`, so a sandbox
+      number *is* a tuner number — measured at **under 10 ms per slider move**
+      over HTTP, with no model in the process.
+
+      Three guards keep it that way: sliders span exactly `tune.GRID` (what the
+      cache was warmed over), every request checks `cache.covers()`, and the
+      reranker handed to the scoring path raises instead of computing.
+
+      Against overfitting: one fold is held back and peeking at it is counted;
+      distinct parameter sets evaluated are counted and displayed; deltas are
+      judged against the tuner's own 1/n margin; everything is labelled
+      in-sample. There is no write path to `params.json` — the only
+      adoption-shaped control starts `retrieval.tune`.
+
+- [x] **Hardened the authoring guardrails.** The overlap meter had a false
+      green: an unindexed title gives it an empty body, every computation then
+      honestly reports 0% borrowed, and the badge went green on a question
+      nobody had verified. Unknown is now its own loud state, it blocks
+      approval in the UI as well as at merge, and the JSON reports
+      `distinctive: null` rather than 0.0. Draft reading became total —
+      bad JSON lines, non-object lines and wrong-typed fields are repaired in
+      memory and reported, never written back. The meter bands were
+      calibrated against the approved gold set rather than guessed. And the
+      model-free boundary is now enforced by a static import scan plus a
+      subprocess that exercises every route and checks `sys.modules`.
+
 ## Next: retrieval quality
 
 - [ ] **Latency budget.** 8 s/query on CPU is fine for eval and batch, not for

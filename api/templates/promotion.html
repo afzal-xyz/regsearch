@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Promotion — Title {{ title }}{% endblock %}
+
+{% block body %}
+<h1>Approve &amp; merge — Title {{ title }}</h1>
+
+{% if result.ok %}
+  <div class="banner good">
+    <strong>{{ result.summary }}</strong>
+    {% if result.already_present %}
+      <div>{{ result.already_present | length }} entry(s) were already in the gold set and
+        were retired from the draft rather than appended twice.</div>
+    {% endif %}
+    {% if result.still_draft %}
+      <div>{{ result.still_draft }} entry(s) are still marked draft and were left alone.</div>
+    {% endif %}
+  </div>
+
+  {% if result.staleness %}
+    <div class="banner warn">
+      <strong>Re-tune required.</strong> The gold set has changed, so
+      <code>retrieval/params.json</code> no longer describes it and
+      <code>retrieval.tune --check</code> will fail:
+      <ul>{% for reason in result.staleness %}<li>{{ reason }}</li>{% endfor %}</ul>
+      Nothing here edits parameters. Run the tuner — it adopts a change only when the
+      cross-validated gain beats 1/n.
+      <form method="post" action="/jobs/tune">
+        <input type="hidden" name="dry_run" value="1">
+        <button type="submit">Re-tune (dry run)</button>
+      </form>
+    </div>
+  {% endif %}
+
+  {% if result.promoted %}
+    <h2>Merged</h2>
+    <ul>{% for entry in result.promoted %}
+      <li>{{ entry.question }}
+        <code>{{ entry.relevant_citations | join(", ") or "(negative)" }}</code></li>
+    {% endfor %}</ul>
+  {% endif %}
+
+{% else %}
+  <div class="banner bad">
+    <strong>Nothing was written.</strong> The merge is all-or-nothing, so the gold set is
+    exactly as it was.
+  </div>
+
+  {% if result.bad_citations %}
+    <h2>Citations not in the index</h2>
+    <p class="muted">A question whose cited section does not exist can never be answered
+      correctly; it would drag recall down forever without ever looking like a bug.</p>
+    <table>
+      <thead><tr><th>question</th><th>citation</th></tr></thead>
+      <tbody>{% for question, cite in result.bad_citations %}
+        <tr><td class="q">{{ question }}</td><td class="mono">{{ cite }}</td></tr>
+      {% endfor %}</tbody>
+    </table>
+  {% endif %}
+
+  {% if result.errors %}
+    <h2>Validation errors</h2>
+    <ul>{% for problem in result.errors %}<li class="mono">{{ problem }}</li>{% endfor %}</ul>
+  {% endif %}
+{% endif %}
+
+{% if result.warnings %}
+  <h2>Warnings</h2>
+  <ul>{% for problem in result.warnings %}<li class="mono">{{ problem }}</li>{% endfor %}</ul>
+{% endif %}
+
+{% if result.pre_existing %}
+  <h2>Already in the gold set</h2>
+  <p class="muted">These problems predate this merge, so they did not block it — the gate's
+    job is to stop new breakage, not to make the file unappendable until someone else's
+    entry is fixed. They still need fixing.</p>
+  <ul>{% for problem in result.pre_existing %}<li class="mono">{{ problem }}</li>{% endfor %}</ul>
+{% endif %}
+
+<p><a class="btn" href="/authoring/{{ title }}">back to the queue</a>
+   <a class="btn" href="/authoring">all titles</a></p>
+{% endblock %}

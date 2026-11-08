@@ -1,0 +1,185 @@
+{% extends "base.html" %}
+{% block title %}RegSearch — eval dashboard{% endblock %}
+
+{% block body %}
+<h1>Eval dashboard</h1>
+<p class="muted">Every number here was produced by <code>python -m eval.run</code> and read back
+  off disk. Nothing on this page scores a question.</p>
+
+{# ---------- corpus + parameter health ---------- #}
+<section>
+  <h2>Corpus and parameters</h2>
+  {% if health.error %}
+    <div class="banner bad">Could not read the corpus: {{ health.error }}</div>
+  {% else %}
+    <div class="grid">
+      <div class="card">
+        <h3>Declared corpus</h3>
+        <ul class="mono">
+          {% for t in health.titles %}<li>{{ t.label }} @ {{ t.date }}</li>{% endfor %}
+        </ul>
+        <p class="muted">{{ health.gold_n }} approved gold questions</p>
+      </div>
+      <div class="card">
+        <h3>Tuned parameters</h3>
+        <table>
+          {% for key, value in health.params.items() %}
+          <tr><td class="mono">{{ key }}</td><td class="num mono">{{ value }}</td></tr>
+          {% endfor %}
+        </table>
+      </div>
+      <div class="card">
+        <h3>Provenance</h3>
+        {% if health.provenance %}
+          <p class="mono">tuned {{ health.provenance.tuned_at }}<br>
+            on {{ health.provenance.gold_n }} questions<br>
+            reranker {{ health.provenance.rerank_model or "—" }}</p>
+          <p class="muted">{{ health.provenance.note }}</p>
+          <p class="muted">Cross-validated objective:
+            {{ fmt(health.provenance.objective, 4) }} — not an in-sample score.</p>
+        {% else %}
+          <p class="muted">never tuned; code defaults in use</p>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if health.staleness %}
+      <div class="banner warn">
+        <strong>Parameters are stale.</strong> <code>retrieval.tune --check</code> would fail:
+        <ul>{% for reason in health.staleness %}<li>{{ reason }}</li>{% endfor %}</ul>
+        Re-tune with the button below — the tuner adopts a change only when the
+        cross-validated gain beats 1/n.
+      </div>
+    {% else %}
+      <div class="banner good">Parameters match the live corpus, gold set and reranker.</div>
+    {% endif %}
+  {% endif %}
+</section>
+
+{# ---------- latest run and its deltas ---------- #}
+<section>
+  <h2>Latest run</h2>
+  {% if not current %}
+    <p class="muted">No runs in <code>eval/results/</code> yet. Start one below.</p>
+  {% else %}
+    <p>
+      <a href="/runs/{{ current.file }}"><strong>{{ current.file }}</strong></a>
+      · commit <code>{{ current.git_commit or "?" }}</code>
+      · {{ current.n_in_corpus }} in-corpus + {{ current.n_negatives }} negatives
+      · k={{ current.k }}
+      {% if current.rerank_model %}· reranker <code>{{ current.rerank_model }}</code>{% endif %}
+    </p>
+
+    {% if reference %}
+      <p class="muted">compared against {{ reference.file }}
+        (commit <code>{{ reference.git_commit or "?" }}</code>)</p>
+    {% endif %}
+
+    {% if comparison.note %}
+      <div class="banner warn">{{ comparison.note }}</div>
+    {% endif %}
+    {% if comparison.regressions %}
+      <div class="banner bad">
+        {{ comparison.regressions | length }} metric(s) dropped beyond the threshold.
+      </div>
+    {% elif comparison.reference and comparison.comparable %}
+      <div class="banner good">No regressions beyond the threshold.</div>
+    {% endif %}
+
+    {% for group in comparison.groups %}
+      {% set rows = comparison.rows(group) %}
+      <h3>{{ group }} (n = {{ rows[0].n if rows else 0 }})</h3>
+      <table>
+        <thead><tr>
+          <th>mode</th><th>metric</th>
+          <th class="num">before</th><th class="num">after</th><th class="num">change</th><th></th>
+        </tr></thead>
+        <tbody>
+        {% for d in rows %}
+          <tr>
+            <td class="mono">{{ d.mode }}</td>
+            <td class="mono">{{ d.metric }}</td>
+            <td class="num">{{ fmt(d.before) }}</td>
+            <td class="num">{{ fmt(d.after) }}</td>
+            <td class="num {% if d.change and d.change > 0 %}up{% elif d.is_drop %}down{% endif %}">
+              {{ fmt_delta(d.change) }}
+            </td>
+            <td>
+              {% if d.is_regression(comparison.threshold) and comparison.comparable %}
+                <span class="regression">✗ regression</span>
+              {% elif d.is_drop %}
+                <span class="muted">drop within threshold
+                  ({{ fmt(d.allowed_drop(comparison.threshold)) }})</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endfor %}
+
+    {% if comparison.reference %}
+      <p><a class="btn" href="/runs/{{ current.file }}/diff">Which questions moved?</a></p>
+    {% endif %}
+  {% endif %}
+</section>
+
+{# ---------- history ---------- #}
+{% if history %}
+<section>
+  <h2>History</h2>
+  {% if trends %}
+    <div class="grid">
+      {% for t in trends %}
+        <div class="card">
+          <h3>{{ t.mode }} · {{ t.metric }} <span class="num">{{ fmt(t.last) }}</span></h3>
+          {{ t.svg | safe }}
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+  <table>
+    <thead><tr>
+      <th>run</th><th>commit</th><th>modes</th>
+      <th class="num">questions</th><th>gold digest</th>
+    </tr></thead>
+    <tbody>
+      {% for m in history %}
+      <tr>
+        <td><a href="/runs/{{ m.file }}">{{ m.timestamp }}</a></td>
+        <td class="mono">{{ m.git_commit or "—" }}</td>
+        <td class="mono">{{ m.modes | join(", ") }}</td>
+        <td class="num">{{ m.gold_n or "—" }}</td>
+        <td class="mono">{{ m.gold_sha256 or "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if report_exists %}
+    <p class="muted">The standing CI report is still at <code>eval/report.html</code>.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+{# ---------- jobs ---------- #}
+<section>
+  <h2>Run a gate</h2>
+  <p class="muted">Each button shells out to the same command CI runs, in its own process.
+    One at a time: eval and tune each saturate the CPU.</p>
+  <div class="controls">
+    {% for kind, label in JOB_LABELS.items() %}
+      <form method="post" action="/jobs/{{ kind }}">
+        {% if kind == "tune" %}<input type="hidden" name="dry_run" value="1">{% endif %}
+        <button type="submit" {% if active %}disabled{% endif %}>{{ label }}</button>
+      </form>
+    {% endfor %}
+  </div>
+  {% if active %}
+    <div class="banner warn">
+      <a href="/jobs/{{ active.id }}">{{ active.kind }}</a> is running — buttons are disabled
+      until it finishes.
+    </div>
+  {% endif %}
+  <div hx-get="/jobs" hx-trigger="load, every 3s" hx-swap="innerHTML"></div>
+</section>
+{% endblock %}

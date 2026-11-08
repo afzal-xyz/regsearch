@@ -1,0 +1,31 @@
+{% if error %}
+  <div class="banner bad">{{ error }}</div>
+{% elif evaluation %}
+  <div class="banner">
+    <strong>Held-out fold</strong> ({{ evaluation.metrics.n }} questions, looked at
+    {{ holdout_peeks }} time{{ "" if holdout_peeks == 1 else "s" }} this session)
+    <table>
+      <thead><tr><th>metric</th><th class="num">production</th>
+        <th class="num">this setting</th><th class="num">change</th></tr></thead>
+      <tbody>
+        {% for label, before, after in [
+          ("objective", evaluation.baseline.objective, evaluation.metrics.objective),
+          ("recall@10", evaluation.baseline.recall10, evaluation.metrics.recall10),
+          ("MRR@10", evaluation.baseline.mrr10, evaluation.metrics.mrr10),
+        ] %}
+          <tr><td>{{ label }}</td>
+            <td class="num">{{ fmt(before, 4) }}</td>
+            <td class="num">{{ fmt(after, 4) }}</td>
+            <td class="num {{ 'up' if after > before else ('down' if after < before else '') }}">
+              {{ fmt_delta(after - before) }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="tiny">
+      This fold is small ({{ evaluation.metrics.n }} questions), so its noise margin is
+      {{ fmt(evaluation.margin, 4) }} — wider than the explore split's. It is a sanity
+      check, not a verdict. The verdict is <code>retrieval.tune</code>, which rotates every
+      fold rather than spending one.
+    </p>
+  </div>
+{% endif %}

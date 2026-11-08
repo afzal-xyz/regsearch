@@ -1,0 +1,35 @@
+{% if overlap is none %}
+  <span class="meter unknown">not checked</span>
+  <span class="muted">No meter was computed for this row.</span>
+{% elif overlap.verdict == "empty" %}
+  <span class="meter empty">meter idle</span> <span class="muted">{{ overlap.advice }}</span>
+{% elif overlap.verdict == "n/a" %}
+  <span class="meter na">not applicable</span> <span class="muted">{{ overlap.advice }}</span>
+{% elif overlap.verdict == "unknown" %}
+  {# Deliberately styled as a warning, not a neutral. A reader skimming for
+     green badges must not mistake "could not check" for "checked and clean". #}
+  <span class="meter unknown">⚠ NOT CHECKED</span>
+  <strong class="warn-text">{{ overlap.advice }}</strong>
+{% else %}
+  <div class="meter-box">
+    <span class="meter {{ overlap.verdict }}">
+      {{ overlap.verdict }} · {{ overlap.percent }}% borrowed
+    </span>
+    <span class="muted">{{ overlap.advice }}</span>
+  </div>
+  {% if overlap.shared %}
+    <div class="terms">
+      shared with the section:
+      {% for term in overlap.shared[:12] %}
+        <span class="term {{ 'rare' if term.distinctive else 'common' }}"
+              title="appears in {{ term.df }} section(s); rarity {{ '%.2f'|format(term.rarity) }}">
+          {{ term.term }}</span>
+      {% endfor %}
+      {% if overlap.shared | length > 12 %}
+        <span class="muted">+{{ overlap.shared | length - 12 }} more</span>
+      {% endif %}
+    </div>
+    <p class="muted tiny">Highlighted terms are rare across the corpus — those are the ones
+      that make a question answerable by string overlap. Common shared words are fine.</p>
+  {% endif %}
+{% endif %}

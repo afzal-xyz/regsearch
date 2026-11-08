@@ -1,0 +1,106 @@
+{% set entry = item.entry %}
+{% set id = item.draft_id %}
+<div class="draft {{ 'approved' if entry.status == 'approved' else '' }}{{ ' unverified' if item.unverified else '' }}" id="draft-{{ id }}">
+
+  {% if item.unverified %}
+    <div class="banner bad">
+      <strong>Unverified.</strong> {{ entry.relevant_citations | join(", ") }} is not in the
+      index, so the overlap meter could not check this question and it cannot be approved.
+      Index the title, or fix the citation.
+    </div>
+  {% endif %}
+
+  {# ---- what the author sees by default: citation, heading, breadcrumb ---- #}
+  <div class="draft-head">
+    <div>
+      {% if item.is_negative %}
+        <span class="pill">negative — no correct section</span>
+      {% else %}
+        <code class="cite">{{ entry.relevant_citations | join(", ") or "no citation" }}</code>
+        {% if item.section.found %}
+          <strong>{{ item.section.heading }}</strong>
+          {% if item.section.breadcrumb %}
+            <div class="crumb">{{ item.section.breadcrumb | join(" › ") }}</div>
+          {% endif %}
+        {% else %}
+          <span class="regression">not in the index</span>
+        {% endif %}
+      {% endif %}
+    </div>
+    <div>
+      <span class="pill">{{ entry.kind }}</span>
+      <span class="pill {{ 'succeeded' if entry.status == 'approved' else '' }}">
+        {{ entry.status }}</span>
+      {% if entry.revealed %}<span class="pill" title="the body was opened while authoring">
+        text seen</span>{% endif %}
+      {% if saved %}<span class="pill succeeded">saved</span>{% endif %}
+    </div>
+  </div>
+
+  {# ---- the body text: not in this payload until asked for ---- #}
+  {% if item.section.found %}
+    <div class="reveal">
+      <button type="button"
+              hx-get="/authoring/{{ title }}/reveal/{{ id }}"
+              hx-target="#text-{{ id }}"
+              hx-swap="innerHTML"
+              hx-disabled-elt="this">Reveal text</button>
+      <span class="muted tiny">The section body is not loaded into this page. Open it only
+        if the heading is not enough — reading it first makes paraphrase harder.</span>
+      <div id="text-{{ id }}"></div>
+    </div>
+  {% endif %}
+
+  {# ---- the form ---- #}
+  <form hx-post="/authoring/{{ title }}/entry/{{ id }}"
+        hx-target="#draft-{{ id }}"
+        hx-swap="outerHTML">
+    <label>Question
+      <textarea name="question" rows="2" placeholder="Ask it the way the public would…"
+                hx-post="/authoring/{{ title }}/meter"
+                hx-trigger="keyup changed delay:400ms"
+                hx-target="#meter-{{ id }}"
+                hx-swap="innerHTML"
+                hx-vals='{"citation": {{ (entry.relevant_citations or [""])[0] | tojson }},
+                          "kind": {{ entry.kind | tojson }}}'
+      >{{ entry.question }}</textarea>
+    </label>
+
+    <div id="meter-{{ id }}" class="meter-slot">
+      {% with overlap = item.overlap %}{% include "partials/overlap.html" %}{% endwith %}
+    </div>
+
+    <label>Notes
+      <textarea name="notes" rows="2">{{ entry.notes }}</textarea>
+    </label>
+
+    <div class="controls">
+      <label class="inline">Kind
+        <select name="kind">
+          {% for k in ("prose", "citation") %}
+            <option value="{{ k }}" {% if entry.kind == k %}selected{% endif %}>{{ k }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="inline">Citations
+        <input type="text" name="citations" size="28"
+               value="{{ entry.relevant_citations | join(', ') }}">
+      </label>
+      <label class="inline">Status
+        <select name="status">
+          <option value="draft" {% if entry.status != "approved" %}selected{% endif %}>draft</option>
+          <option value="approved"
+                  {% if entry.status == "approved" %}selected{% endif %}
+                  {% if not item.approvable %}disabled{% endif %}>approved</option>
+          {% if entry.status not in ("draft", "approved") %}
+            <option value="{{ entry.status }}" selected>{{ entry.status }} (invalid)</option>
+          {% endif %}
+        </select>
+      </label>
+      <button type="submit">Save</button>
+      <button type="button" class="danger"
+              hx-post="/authoring/{{ title }}/delete/{{ id }}"
+              hx-confirm="Delete this draft entry?">Delete</button>
+    </div>
+  </form>
+</div>

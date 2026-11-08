@@ -1,0 +1,22 @@
+{% if jobs %}
+<table>
+  <thead><tr>
+    <th>job</th><th>command</th><th>status</th><th>started</th><th class="num">lines</th>
+  </tr></thead>
+  <tbody>
+    {% for job in jobs %}
+    <tr>
+      <td><a href="/jobs/{{ job.id }}">{{ job.kind }}</a></td>
+      <td class="mono">{{ job.command }}</td>
+      <td><span class="pill {{ job.status }}">{{ job.status }}</span>
+        {% if job.returncode is not none %}<span class="muted">rc={{ job.returncode }}</span>{% endif %}
+      </td>
+      <td class="mono">{{ job.started_at }}</td>
+      <td class="num">{{ job.total_lines }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No jobs run yet in this session.</p>
+{% endif %}
