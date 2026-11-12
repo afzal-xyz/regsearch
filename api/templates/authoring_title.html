@@ -51,18 +51,31 @@
   </div>
 {% else %}
 
-  <div class="controls">
-    <form method="post" action="/authoring/{{ title }}/new">
-      <button type="submit">Add a blank entry</button>
-    </form>
-    <form method="post" action="/authoring/{{ title }}/promote">
-      <button type="submit" class="primary">Approve &amp; merge into gold.jsonl</button>
-    </form>
-    <span class="muted">
-      {{ items | selectattr("entry.status", "equalto", "approved") | list | length }}
-      of {{ items | length }} marked approved
-    </span>
-  </div>
+  {% include "partials/promote_controls.html" %}
+
+  {# Bulk status: each row's checkbox belongs to this form via form="bulk", so it
+     works from inside the row markup without nesting forms. #}
+  <form id="bulk" method="post" action="/authoring/{{ title }}/status" class="controls">
+    <button type="button" id="select-approvable"
+            title="Ticks every row with a written question whose citations are indexed">
+      Select all approvable</button>
+    <button type="button" id="select-none">Select none</button>
+    <button type="submit" name="status" value="approved">Mark selected approved</button>
+    <button type="submit" name="status" value="draft">Mark selected draft</button>
+    <span class="muted tiny">Changes status only, in one write. Save any row whose text
+      you have edited first — this reloads the page.</span>
+  </form>
+  <script>
+    document.getElementById("select-approvable").addEventListener("click", () => {
+      document.querySelectorAll('input[form="bulk"][name="draft_id"]').forEach(box => {
+        box.checked = box.dataset.approvable === "1";
+      });
+    });
+    document.getElementById("select-none").addEventListener("click", () => {
+      document.querySelectorAll('input[form="bulk"][name="draft_id"]')
+        .forEach(box => { box.checked = false; });
+    });
+  </script>
 
   <p class="muted">Only entries marked <code>approved</code> are merged, and the merge is
     all-or-nothing: if any one of them fails validation, nothing is written.</p>

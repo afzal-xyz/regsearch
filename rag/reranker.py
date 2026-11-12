@@ -48,7 +48,7 @@ from dataclasses import replace
 import numpy as np
 
 from index import store
-from index.embedder import DEFAULT_MODEL, Embedder, contextualize
+from index.embedder import DEFAULT_MODEL, Embedder, contextualize, import_sentence_transformers
 from index.store import DEFAULT_DB, connect
 from retrieval.search import SearchResult, _snippet, hybrid_search
 
@@ -126,7 +126,7 @@ class Reranker:
     @property
     def model(self):
         if self._model is None:
-            from sentence_transformers import CrossEncoder
+            CrossEncoder = import_sentence_transformers().CrossEncoder
 
             logger.info("loading cross-encoder %s", self.model_name)
             self._model = CrossEncoder(self.model_name, device=self._device)

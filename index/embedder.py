@@ -44,6 +44,39 @@ def contextualize(chunk) -> str:
     return f"{prefix}\n{text}" if prefix else text
 
 
+def import_sentence_transformers():
+    """Import ``sentence_transformers``, explaining OS code-integrity blocks.
+
+    On Windows with Smart App Control (or a WDAC policy) enforcing, a compiled
+    extension deep in the import chain (sentence_transformers -> sklearn ->
+    scipy) can be refused with "DLL load failed ... An Application Control
+    policy has blocked this file". That is an OS policy decision, not a broken
+    install — reinstalling yields the same bytes and the same block — so say
+    so plainly instead of surfacing a 40-frame traceback.
+    """
+    try:
+        import sentence_transformers
+    except ImportError as e:
+        msg = str(e)
+        if "Application Control" in msg or "DLL load failed" in msg:
+            raise ImportError(
+                "the ML stack could not be loaded: Windows refused a compiled "
+                f"extension ({msg}).\n"
+                "This is Smart App Control / App Control for Business blocking an "
+                "unsigned binary, not a RegSearch or install bug; reinstalling will "
+                "not help. Options:\n"
+                "  - run model-backed commands (prescore, tune, onboard, eval) from "
+                "WSL or Linux, where the policy does not apply;\n"
+                "  - on a managed machine, ask IT to allow the file;\n"
+                "  - on a personal machine, turning Smart App Control off is the "
+                "only local switch (Windows Security > App & browser control).\n"
+                "Blocked files are listed in Event Viewer > Applications and "
+                "Services Logs > Microsoft > Windows > CodeIntegrity > Operational."
+            ) from e
+        raise
+    return sentence_transformers
+
+
 class Embedder:
     def __init__(
         self,
@@ -62,7 +95,7 @@ class Embedder:
     @property
     def model(self):
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            SentenceTransformer = import_sentence_transformers().SentenceTransformer
 
             logger.info("loading embedding model %s", self.model_name)
             self._model = SentenceTransformer(self.model_name, device=self._device)

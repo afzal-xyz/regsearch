@@ -8,8 +8,9 @@
   <div class="banner good">
     <strong>{{ result.summary }}</strong>
     {% if result.already_present %}
-      <div>{{ result.already_present | length }} entry(s) were already in the gold set and
-        were retired from the draft rather than appended twice.</div>
+      <div>{{ result.already_present | length }} entry(s) were already in the gold set,
+        identical field for field, and were retired from the draft rather than appended
+        twice.</div>
     {% endif %}
     {% if result.still_draft %}
       <div>{{ result.still_draft }} entry(s) are still marked draft and were left alone.</div>
@@ -41,9 +42,23 @@
 
 {% else %}
   <div class="banner bad">
-    <strong>Nothing was written.</strong> The merge is all-or-nothing, so the gold set is
-    exactly as it was.
+    <strong>Nothing was written.</strong> The merge is all-or-nothing across both files:
+    the gold set and the draft queue are exactly as they were.
   </div>
+
+  {% if result.conflicts %}
+    <h2>Already in the gold set, but different</h2>
+    <p class="muted">These questions are in <code>gold.jsonl</code> already, with different
+      content. Retiring the draft row would throw away its version; appending it would
+      count the question twice. Edit the draft row to match gold, or delete it if gold's
+      version is the one to keep.</p>
+    <table>
+      <thead><tr><th>question</th><th>differs in</th></tr></thead>
+      <tbody>{% for question, fields in result.conflicts %}
+        <tr><td class="q">{{ question }}</td><td class="mono">{{ fields | join(", ") }}</td></tr>
+      {% endfor %}</tbody>
+    </table>
+  {% endif %}
 
   {% if result.bad_citations %}
     <h2>Citations not in the index</h2>

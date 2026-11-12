@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -1136,3 +1137,466 @@ class TestCalibratedBands:
                       if rarity >= authoring.RARE_TERM]
         assert qualifying, "no document frequency qualifies as a term of art"
         assert max(qualifying) <= vocab.n_sections * 0.02, "'rare' must mean rare"
+
+
+# --- the draft queue is never the casualty of a failed merge ----------------
+#
+# Regression for the Title 31 incident: every approved draft row asked a question
+# already in gold.jsonl (hand-merged earlier, with longer notes). Promotion matched
+# on question text alone, wrote nothing to gold, then retired all 30 rows anyway —
+# gold stayed at 143 lines and the draft went to 0. Every test below asserts on the
+# draft's *bytes*, not its parsed entries: "still parses to the same rows" would
+# let a lossy rewrite (dropped lines, re-serialised text) through.
+
+
+def _draft_bytes(eval_dir, title=4):
+    path = authoring.draft_path(title, eval_dir)
+    return path.read_bytes() if path.exists() else None
+
+
+class TestPromotionNeverLosesTheDraft:
+    def _promote(self, db, eval_dir, gold_path, title=4, specs=(SPEC4,)):
+        return promote(title, specs=list(specs), eval_dir=eval_dir,
+                       gold_path=gold_path, db_path=db)
+
+    # -- the incident itself --
+
+    def test_rows_already_in_gold_but_different_are_a_conflict_not_a_retirement(
+        self, db, eval_dir, gold_path
+    ):
+        cite = sections_in(db)[0]
+        goldset.write([{"question": "q one", "relevant_citations": [cite], "kind": "prose",
+                        "status": "approved", "notes": "verified, longer notes"}], gold_path)
+        save_draft(4, [approved(cite, "q one", notes="short notes")], eval_dir)
+        draft_before, gold_before = _draft_bytes(eval_dir), gold_path.read_bytes()
+
+        result = self._promote(db, eval_dir, gold_path)
+
+        assert not result.ok
+        assert result.errors[0].check == "authoring:conflicts-with-gold"
+        assert result.conflicts == (("q one", ("notes",)),)
+        assert _draft_bytes(eval_dir) == draft_before, "the draft row must survive"
+        assert gold_path.read_bytes() == gold_before
+
+    def test_a_different_citation_is_a_conflict_too(self, db, eval_dir, gold_path):
+        a, b = sections_in(db)[:2]
+        goldset.write([{"question": "q", "relevant_citations": [a], "kind": "prose",
+                        "status": "approved"}], gold_path)
+        save_draft(4, [approved(b, "q")], eval_dir)
+        result = self._promote(db, eval_dir, gold_path)
+        assert not result.ok
+        assert result.conflicts == (("q", ("relevant_citations",)),)
+        assert len(load_draft(4, eval_dir)) == 1
+
+    def test_approving_a_question_gold_holds_as_draft_is_a_conflict(
+        self, db, eval_dir, gold_path
+    ):
+        """Retiring it would silently leave the gold row unapproved."""
+        cite = sections_in(db)[0]
+        goldset.write([{"question": "q", "relevant_citations": [cite], "kind": "prose",
+                        "status": "draft"}], gold_path)
+        save_draft(4, [approved(cite, "q")], eval_dir)
+        result = self._promote(db, eval_dir, gold_path)
+        assert not result.ok
+        assert result.conflicts == (("q", ("status",)),)
+
+    def test_one_conflict_blocks_the_whole_batch(self, db, eval_dir, gold_path):
+        cite = sections_in(db)[0]
+        goldset.write([{"question": "old", "relevant_citations": [cite], "kind": "prose",
+                        "status": "approved", "notes": "gold"}], gold_path)
+        save_draft(4, [approved(cite, "old", notes="draft"),
+                       approved(cite, "genuinely new")], eval_dir)
+        gold_before, draft_before = gold_path.read_bytes(), _draft_bytes(eval_dir)
+
+        assert not self._promote(db, eval_dir, gold_path).ok
+        assert gold_path.read_bytes() == gold_before, "the new one must not land alone"
+        assert _draft_bytes(eval_dir) == draft_before
+
+    def test_the_real_title_31_draft_and_gold_reproduce_the_incident_safely(
+        self, db, eval_dir, gold_path
+    ):
+        """The committed files, with every row approved as the author had them."""
+        from api.main import REPO_ROOT
+
+        src_draft = REPO_ROOT / "eval" / "gold_title31_draft.jsonl"
+        src_gold = REPO_ROOT / "eval" / "gold.jsonl"
+        if not (src_draft.exists() and src_gold.exists()):
+            pytest.skip("the committed Title 31 files are not present")
+        gold_path.write_bytes(src_gold.read_bytes())
+        rows = [json.loads(line) for line in src_draft.read_text("utf-8").splitlines()
+                if line.strip()]
+        for row in rows:
+            row["status"] = "approved"
+        save_draft(31, rows, eval_dir)
+        draft_before, gold_before = _draft_bytes(eval_dir, 31), gold_path.read_bytes()
+
+        result = self._promote(db, eval_dir, gold_path, title=31, specs=(SPEC31,))
+
+        assert not result.ok
+        assert len(result.conflicts) == len(rows) == 30
+        assert _draft_bytes(eval_dir, 31) == draft_before, "all 30 rows must survive"
+        assert gold_path.read_bytes() == gold_before
+
+    # -- empty and refused promotions --
+
+    def test_an_empty_promotion_leaves_the_draft_byte_identical(self, db, eval_dir, gold_path):
+        save_draft(4, [approved(sections_in(db)[0], f"q{i}", status="draft",
+                                draft_id=f"d{i}") for i in range(30)], eval_dir)
+        before = _draft_bytes(eval_dir)
+
+        result = self._promote(db, eval_dir, gold_path)
+
+        assert not result.ok
+        assert result.errors[0].check == "authoring:nothing-approved"
+        assert result.still_draft == 30
+        assert _draft_bytes(eval_dir) == before
+        assert not gold_path.exists()
+
+    def test_an_empty_draft_file_is_refused_and_left_alone(self, db, eval_dir, gold_path):
+        path = authoring.draft_path(4, eval_dir)
+        path.write_text("\n", encoding="utf-8")
+        assert not self._promote(db, eval_dir, gold_path).ok
+        assert path.read_bytes() == b"\n"
+
+    def test_a_missing_draft_is_refused_and_not_created(self, db, eval_dir, gold_path):
+        assert not self._promote(db, eval_dir, gold_path).ok
+        assert not authoring.draft_path(4, eval_dir).exists()
+
+    def test_a_validation_failure_leaves_the_draft_byte_identical(
+        self, db, eval_dir, gold_path
+    ):
+        save_draft(4, [approved(sections_in(db)[0], "fine"),
+                       approved("4 CFR § 999.9", "cites nothing real")], eval_dir)
+        before = _draft_bytes(eval_dir)
+        assert not self._promote(db, eval_dir, gold_path).ok
+        assert _draft_bytes(eval_dir) == before
+
+    def test_unreadable_lines_block_promotion_rather_than_being_deleted(
+        self, db, eval_dir, gold_path
+    ):
+        cite = sections_in(db)[0]
+        path = authoring.draft_path(4, eval_dir)
+        path.write_text(json.dumps(approved(cite, "good")) + "\n{oops not json\n",
+                        encoding="utf-8")
+        before = path.read_bytes()
+
+        result = self._promote(db, eval_dir, gold_path)
+
+        assert not result.ok
+        assert result.errors[0].check == "authoring:draft-unreadable-lines"
+        assert path.read_bytes() == before
+        assert not gold_path.exists()
+
+    # -- failures part-way through the commit --
+
+    def _fail_writes_to(self, monkeypatch, name, *, times=1):
+        """Make the first ``times`` atomic writes to a file called ``name`` raise."""
+        real = authoring._atomic_write
+        left = {"n": times}
+
+        def flaky(path, data):
+            if Path(path).name == name and left["n"] > 0:
+                left["n"] -= 1
+                raise OSError(f"simulated failure writing {name}")
+            return real(path, data)
+
+        monkeypatch.setattr(authoring, "_atomic_write", flaky)
+
+    def test_a_failed_gold_write_leaves_both_files_alone(
+        self, db, eval_dir, gold_path, monkeypatch
+    ):
+        cite = sections_in(db)[0]
+        goldset.write([{"question": "existing", "relevant_citations": [cite],
+                        "kind": "prose", "status": "approved"}], gold_path)
+        save_draft(4, [approved(cite, "new")], eval_dir)
+        gold_before, draft_before = gold_path.read_bytes(), _draft_bytes(eval_dir)
+        self._fail_writes_to(monkeypatch, "gold.jsonl")
+
+        result = self._promote(db, eval_dir, gold_path)
+
+        assert not result.ok
+        assert result.errors[0].check == "authoring:write-failed"
+        assert "draft was not modified" in result.errors[0].message
+        assert gold_path.read_bytes() == gold_before
+        assert _draft_bytes(eval_dir) == draft_before
+
+    def test_gold_that_does_not_read_back_as_written_is_rolled_back(
+        self, db, eval_dir, gold_path, monkeypatch
+    ):
+        cite = sections_in(db)[0]
+        goldset.write([{"question": "existing", "relevant_citations": [cite],
+                        "kind": "prose", "status": "approved"}], gold_path)
+        save_draft(4, [approved(cite, "new")], eval_dir)
+        gold_before, draft_before = gold_path.read_bytes(), _draft_bytes(eval_dir)
+        real_load = authoring.goldset.load
+        calls = {"n": 0}
+
+        def corrupt_readback(path):
+            calls["n"] += 1
+            return [] if calls["n"] == 2 else real_load(path)  # 1st: read, 2nd: verify
+
+        monkeypatch.setattr(authoring.goldset, "load", corrupt_readback)
+        result = self._promote(db, eval_dir, gold_path)
+
+        assert not result.ok
+        assert "did not read back as written" in result.errors[0].message
+        assert gold_path.read_bytes() == gold_before, "rolled back to the original bytes"
+        assert _draft_bytes(eval_dir) == draft_before
+
+    def test_a_failed_draft_write_rolls_gold_back(self, db, eval_dir, gold_path, monkeypatch):
+        cite = sections_in(db)[0]
+        goldset.write([{"question": "existing", "relevant_citations": [cite],
+                        "kind": "prose", "status": "approved"}], gold_path)
+        save_draft(4, [approved(cite, "new")], eval_dir)
+        gold_before, draft_before = gold_path.read_bytes(), _draft_bytes(eval_dir)
+        self._fail_writes_to(monkeypatch, "gold_title4_draft.jsonl")
+
+        result = self._promote(db, eval_dir, gold_path)
+
+        assert not result.ok
+        assert "restored to exactly what it was" in result.errors[0].message
+        assert gold_path.read_bytes() == gold_before
+        assert _draft_bytes(eval_dir) == draft_before
+
+    def test_rolling_back_a_gold_file_that_did_not_exist_removes_it(
+        self, db, eval_dir, gold_path, monkeypatch
+    ):
+        save_draft(4, [approved(sections_in(db)[0], "new")], eval_dir)
+        self._fail_writes_to(monkeypatch, "gold_title4_draft.jsonl")
+        assert not self._promote(db, eval_dir, gold_path).ok
+        assert not gold_path.exists()
+
+    def test_if_the_rollback_fails_too_a_re_run_recovers_without_loss(
+        self, db, eval_dir, gold_path, monkeypatch
+    ):
+        cite = sections_in(db)[0]
+        goldset.write([{"question": "existing", "relevant_citations": [cite],
+                        "kind": "prose", "status": "approved"}], gold_path)
+        save_draft(4, [approved(cite, "new")], eval_dir)
+        draft_before = _draft_bytes(eval_dir)
+        self._fail_writes_to(monkeypatch, "gold_title4_draft.jsonl")
+        monkeypatch.setattr(authoring, "_restore",
+                            lambda *a: (_ for _ in ()).throw(OSError("disk gone")))
+
+        result = self._promote(db, eval_dir, gold_path)
+
+        assert not result.ok
+        assert "run Approve & merge again" in result.errors[0].message
+        assert _draft_bytes(eval_dir) == draft_before, "the draft still holds the work"
+
+        monkeypatch.undo()
+        again = self._promote(db, eval_dir, gold_path)
+        assert again.ok and again.promoted == ()
+        assert [e["question"] for e in goldset.load(gold_path)] == ["existing", "new"]
+        assert load_draft(4, eval_dir) == []
+
+    def test_a_draft_edited_mid_merge_is_kept_and_gold_rolled_back(
+        self, db, eval_dir, gold_path, monkeypatch
+    ):
+        """An editor or a second process takes no lock; its edit must win."""
+        cite = sections_in(db)[0]
+        save_draft(4, [approved(cite, "new")], eval_dir)
+        dpath = authoring.draft_path(4, eval_dir)
+        real = authoring._atomic_write
+
+        def edit_draft_after_gold(path, data):
+            out = real(path, data)
+            if Path(path).name == "gold.jsonl":
+                dpath.write_text(dpath.read_text("utf-8") + json.dumps(
+                    approved(cite, "typed in an editor meanwhile", status="draft")) + "\n",
+                    encoding="utf-8")
+            return out
+
+        monkeypatch.setattr(authoring, "_atomic_write", edit_draft_after_gold)
+        edited_result = self._promote(db, eval_dir, gold_path)
+
+        assert not edited_result.ok
+        assert "edited while the merge was running" in edited_result.errors[0].message
+        assert not gold_path.exists()
+        assert len(load_draft(4, eval_dir)) == 2, "the concurrent edit survives"
+
+    # -- and when it does succeed --
+
+    def test_the_draft_is_cleared_only_once_gold_holds_every_row(
+        self, db, eval_dir, gold_path
+    ):
+        cite = sections_in(db)[0]
+        save_draft(4, [approved(cite, f"question {i}", draft_id=f"d{i}") for i in range(30)],
+                   eval_dir)
+        result = self._promote(db, eval_dir, gold_path)
+        assert result.ok, result.errors
+        assert len(goldset.load(gold_path)) == 30
+        assert load_draft(4, eval_dir) == []
+
+
+# --- bulk status: approving 30 rows is one request, not 30 saves -------------
+
+
+class TestBulkStatus:
+    def _queue(self, db, eval_dir, n=3):
+        cite = sections_in(db)[0]
+        rows = [approved(cite, f"question {i}", status="draft", draft_id=f"d{i}")
+                for i in range(n)]
+        save_draft(4, rows, eval_dir)
+        return [r["draft_id"] for r in rows]
+
+    def test_approves_many_rows_in_one_write(self, db, eval_dir, monkeypatch):
+        ids = self._queue(db, eval_dir, n=30)
+        writes = []
+        real = authoring._atomic_write
+        monkeypatch.setattr(authoring, "_atomic_write",
+                            lambda p, d: (writes.append(p), real(p, d))[1])
+
+        changed = authoring.set_status(4, ids, "approved", eval_dir=eval_dir, db_path=db)
+
+        assert changed == ids
+        assert len(writes) == 1
+        assert {e["status"] for e in load_draft(4, eval_dir)} == {"approved"}
+
+    def test_only_status_changes(self, db, eval_dir):
+        ids = self._queue(db, eval_dir)
+        before = load_draft(4, eval_dir)
+        authoring.set_status(4, ids[:1], "approved", eval_dir=eval_dir, db_path=db)
+        after = load_draft(4, eval_dir)
+        assert [{**e, "status": None} for e in after] == [{**e, "status": None} for e in before]
+        assert [e["status"] for e in after] == ["approved", "draft", "draft"]
+
+    def test_one_ineligible_row_refuses_the_whole_selection(self, db, eval_dir):
+        cite = sections_in(db)[0]
+        save_draft(4, [
+            approved(cite, "fine", status="draft", draft_id="ok"),
+            approved(cite, "   ", status="draft", draft_id="empty"),
+            approved("4 CFR § 999.9", "unindexed", status="draft", draft_id="ghost"),
+        ], eval_dir)
+        before = _draft_bytes(eval_dir)
+
+        with pytest.raises(authoring.StatusRefused) as refused:
+            authoring.set_status(4, ["ok", "empty", "ghost", "nope"], "approved",
+                                 eval_dir=eval_dir, db_path=db)
+
+        assert {rid for rid, _ in refused.value.reasons} == {"empty", "ghost", "nope"}
+        assert _draft_bytes(eval_dir) == before
+
+    def test_un_approving_is_always_allowed(self, db, eval_dir):
+        save_draft(4, [approved("4 CFR § 999.9", "unindexed", draft_id="ghost")], eval_dir)
+        assert authoring.set_status(4, ["ghost"], "draft", eval_dir=eval_dir,
+                                    db_path=db) == ["ghost"]
+
+    def test_an_empty_selection_or_bad_status_is_refused(self, db, eval_dir):
+        ids = self._queue(db, eval_dir)
+        with pytest.raises(authoring.StatusRefused):
+            authoring.set_status(4, [], "approved", eval_dir=eval_dir, db_path=db)
+        with pytest.raises(authoring.StatusRefused):
+            authoring.set_status(4, ids, "yolo", eval_dir=eval_dir, db_path=db)
+
+    def test_unreadable_lines_block_a_bulk_save(self, db, eval_dir):
+        path = authoring.draft_path(4, eval_dir)
+        path.write_text(json.dumps(approved(sections_in(db)[0], "q", status="draft",
+                                            draft_id="a")) + "\nnot json\n", encoding="utf-8")
+        before = path.read_bytes()
+        with pytest.raises(authoring.StatusRefused):
+            authoring.set_status(4, ["a"], "approved", eval_dir=eval_dir, db_path=db)
+        assert path.read_bytes() == before
+
+
+# --- the promote controls over HTTP -----------------------------------------
+
+
+class TestPromoteControls:
+    @pytest.fixture
+    def client(self, db, eval_dir, gold_path):
+        from fastapi.testclient import TestClient
+
+        from api.jobs import JobRunner
+        from api.main import REPO_ROOT, Settings, create_app
+
+        app = create_app(
+            Settings(root=REPO_ROOT, eval_dir=eval_dir, gold_path=gold_path, db_path=db,
+                     results_dir=eval_dir / "results"),
+            runner=JobRunner(specs={}),
+        )
+        with TestClient(app) as test_client:
+            yield test_client
+
+    @staticmethod
+    def _promote_button(html):
+        start = html.index('action="/authoring/4/promote"')
+        return html[start:html.index("</button>", start)]
+
+    def test_the_button_is_disabled_when_nothing_is_approved(self, client, eval_dir):
+        save_draft(4, [approved("4 CFR § 7.3", "q", status="draft", draft_id="a")], eval_dir)
+        button = self._promote_button(client.get("/authoring/4").text)
+        assert "disabled" in button
+        assert "merge 0 into" in button
+
+    def test_the_button_is_enabled_and_counts_what_will_merge(self, client, eval_dir):
+        save_draft(4, [approved("4 CFR § 7.3", "q1", draft_id="a"),
+                       approved("4 CFR § 7.3", "q2", status="draft", draft_id="b")], eval_dir)
+        button = self._promote_button(client.get("/authoring/4").text)
+        assert "disabled" not in button
+        assert "merge 1 into" in button
+
+    def test_a_forced_empty_post_is_refused_and_leaves_the_draft_alone(
+        self, client, eval_dir, gold_path
+    ):
+        """The disabled button is a courtesy; the server is the guarantee."""
+        save_draft(4, [approved("4 CFR § 7.3", "q", status="draft", draft_id="a")], eval_dir)
+        before = _draft_bytes(eval_dir)
+        response = client.post("/authoring/4/promote")
+        assert response.status_code == 422
+        assert "the draft queue are exactly as they were" in response.text
+        assert _draft_bytes(eval_dir) == before
+        assert not gold_path.exists()
+
+    def test_a_conflicting_promotion_renders_the_conflicts(self, client, eval_dir, gold_path):
+        goldset.write([{"question": "q", "relevant_citations": ["4 CFR § 7.3"],
+                        "kind": "prose", "status": "approved", "notes": "gold"}], gold_path)
+        save_draft(4, [approved("4 CFR § 7.3", "q", notes="draft", draft_id="a")], eval_dir)
+        response = client.post("/authoring/4/promote")
+        assert response.status_code == 422
+        assert "Already in the gold set, but different" in response.text
+        assert len(load_draft(4, eval_dir)) == 1
+
+    def test_saving_a_row_refreshes_the_controls_out_of_band(self, client, eval_dir):
+        save_draft(4, [approved("4 CFR § 7.3", "q", status="draft", draft_id="a")], eval_dir)
+        response = client.post("/authoring/4/entry/a", data={
+            "question": "q", "kind": "prose", "status": "approved", "citations": "4 CFR § 7.3",
+        })
+        assert response.status_code == 200
+        assert 'id="promote-controls" hx-swap-oob="true"' in response.text
+        assert "1 of 1 marked approved" in response.text
+        assert "disabled" not in self._promote_button(response.text)
+
+    def test_rows_carry_a_bulk_checkbox_marked_with_eligibility(self, client, eval_dir):
+        save_draft(4, [approved("4 CFR § 7.3", "fine", status="draft", draft_id="ok"),
+                       approved("4 CFR § 999.9", "ghost", status="draft", draft_id="no")],
+                   eval_dir)
+        page = client.get("/authoring/4").text
+        assert 'form id="bulk"' in page
+        assert 'value="ok" form="bulk"' in page
+        ok = page[page.index('value="ok" form="bulk"'):][:300]
+        no = page[page.index('value="no" form="bulk"'):][:300]
+        assert 'data-approvable="1"' in ok
+        assert 'data-approvable="0"' in no
+
+    def test_the_bulk_route_approves_the_selection_in_one_request(self, client, eval_dir):
+        save_draft(4, [approved("4 CFR § 7.3", f"q{i}", status="draft", draft_id=f"d{i}")
+                       for i in range(30)], eval_dir)
+        response = client.post(
+            "/authoring/4/status",
+            data={"status": "approved", "draft_id": [f"d{i}" for i in range(30)]},
+            follow_redirects=False,
+        )
+        assert response.status_code == 303
+        assert {e["status"] for e in load_draft(4, eval_dir)} == {"approved"}
+        assert "merge 30 into" in self._promote_button(client.get("/authoring/4").text)
+
+    def test_the_bulk_route_refuses_ineligible_rows_and_writes_nothing(self, client, eval_dir):
+        save_draft(4, [approved("4 CFR § 999.9", "ghost", status="draft", draft_id="no")],
+                   eval_dir)
+        before = _draft_bytes(eval_dir)
+        response = client.post("/authoring/4/status",
+                               data={"status": "approved", "draft_id": ["no"]})
+        assert response.status_code == 422
+        assert "not in the index" in response.text
+        assert _draft_bytes(eval_dir) == before

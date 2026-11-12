@@ -401,6 +401,7 @@ def create_app(
             spec=spec,
             title=title,
             items=items,
+            **_counts(draft.entries),
             file_problems=draft.problems,
             skipped_lines=draft.skipped,
             unverified=[i for i in items if i.unverified],
@@ -467,7 +468,30 @@ def create_app(
         authoring_mod.save_draft(title, draft, settings.eval_dir)
 
         item = _item(settings, entry)
-        return page(request, "partials/draft_row.html", item=item, title=title, saved=True)
+        # The promote controls sit outside the swapped row; refresh them
+        # out-of-band so the approved count and the button's enabled state
+        # follow this save instead of waiting for a reload.
+        return page(
+            request, "partials/draft_row.html", item=item, title=title, saved=True,
+            oob=True, **_counts(draft),
+        )
+
+    @app.post("/authoring/{title}/status")
+    async def authoring_bulk_status(request: Request, title: int):
+        """Set the status of the selected rows in one write — no per-row saving."""
+        _spec(title)
+        form = await request.form()
+        try:
+            authoring_mod.set_status(
+                title,
+                form.getlist("draft_id"),
+                str(form.get("status", "")),
+                eval_dir=settings.eval_dir,
+                db_path=settings.db_path,
+            )
+        except authoring_mod.StatusRefused as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return RedirectResponse(f"/authoring/{title}", status_code=303)
 
     @app.post("/authoring/{title}/delete/{draft_id}")
     def authoring_delete(title: int, draft_id: str):
@@ -723,6 +747,14 @@ def _section_for(settings: Settings, entry: dict) -> authoring_mod.Section:
     return authoring_mod.load_sections(settings.db_path, cites[:1]).get(
         cites[0], authoring_mod.MISSING_SECTION
     )
+
+
+def _counts(entries: list[dict]) -> dict:
+    """What the promote controls need: how many rows exist and are approved."""
+    return {
+        "total_count": len(entries),
+        "approved_count": sum(1 for e in entries if e.get("status") == "approved"),
+    }
 
 
 def _item(settings: Settings, entry: dict) -> authoring_mod.DraftItem:

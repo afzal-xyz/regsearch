@@ -1,0 +1,14 @@
+{# Rendered in the queue page, and out-of-band after every row save so the count and
+   the button follow the file rather than the page load. #}
+<div class="controls" id="promote-controls"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <form method="post" action="/authoring/{{ title }}/new">
+    <button type="submit">Add a blank entry</button>
+  </form>
+  <form method="post" action="/authoring/{{ title }}/promote">
+    <button type="submit" class="primary"
+            {% if not approved_count %}disabled
+            title="No row is marked approved, so there is nothing to merge."{% endif %}>
+      Approve &amp; merge {{ approved_count }} into gold.jsonl</button>
+  </form>
+  <span class="muted">{{ approved_count }} of {{ total_count }} marked approved</span>
+</div>

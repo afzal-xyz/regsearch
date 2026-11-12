@@ -274,6 +274,17 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI
         else reranker_mod.Reranker(args.rerank_model or reranker_mod.DEFAULT_RERANK_MODEL)
     )
 
+    # Preflight: load both models now, so a broken ML stack (e.g. a DLL that
+    # Windows Smart App Control refuses) fails here with one clear message
+    # instead of mid-run inside retrieval.
+    try:
+        embedder.model
+        if reranker is not None:
+            reranker.model
+    except ImportError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
     print(
         f"warming the sandbox cache: {len(gold)} gold questions, "
         f"{len(specs)} titles, rerank={not args.no_rerank}"

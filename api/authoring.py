@@ -445,17 +445,23 @@ def draft_path(title: int, eval_dir: Path | str = DEFAULT_EVAL_DIR) -> Path:
     return Path(eval_dir) / DRAFT_TEMPLATE.format(title=int(title))
 
 
-def _atomic_write(path: Path, text: str) -> Path:
+def _atomic_write(path: Path, data: str | bytes) -> Path:
     """Write via a temp file in the same directory, then rename.
 
     ``os.replace`` is atomic within a filesystem, so a reader (or a crash)
     sees either the old file or the new one — never a half-written gold set.
+    ``bytes`` are written verbatim, which is how a rollback restores a file
+    to exactly what it was rather than to a re-serialisation of it.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
+        if isinstance(data, bytes):
+            fh = open(tmp, "wb")
+        else:
+            fh = open(tmp, "w", encoding="utf-8")
+        with fh:
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -466,12 +472,43 @@ def _atomic_write(path: Path, text: str) -> Path:
     return path
 
 
+def _snapshot(path: Path) -> bytes | None:
+    """The file's exact bytes, or ``None`` if it does not exist."""
+    try:
+        return Path(path).read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _restore(path: Path, original: bytes | None) -> None:
+    """Put ``path`` back to ``original`` (``None`` = the file did not exist).
+
+    A no-op when the file already holds those bytes, so rolling back a write
+    that never landed costs nothing and cannot itself fail.
+    """
+    if _snapshot(path) == original:
+        return
+    if original is None:
+        Path(path).unlink(missing_ok=True)
+    else:
+        _atomic_write(Path(path), original)
+
+
 def _as_jsonl(entries: Iterable[dict]) -> str:
     return "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries)
 
 
+# Held by every draft write and for the whole of a promotion, so a row saved
+# from another tab cannot land between promotion reading the draft and
+# rewriting it. Re-entrant because ``set_status`` saves while holding it.
+# Other processes and text editors take no lock; promotion covers those by
+# re-checking the draft's bytes immediately before it rewrites the file.
+_DRAFT_LOCK = threading.RLock()
+
+
 def save_draft(title: int, entries: list[dict], eval_dir: Path | str = DEFAULT_EVAL_DIR) -> Path:
-    return _atomic_write(draft_path(title, eval_dir), _as_jsonl(entries))
+    with _DRAFT_LOCK:
+        return _atomic_write(draft_path(title, eval_dir), _as_jsonl(entries))
 
 
 @dataclass(frozen=True)
@@ -517,7 +554,11 @@ def read_draft(title: int, eval_dir: Path | str = DEFAULT_EVAL_DIR) -> DraftFile
             path=path, entries=[],
             problems=(_problem("draft:unreadable", f"cannot read {path}: {exc}"),),
         )
+    return _parse_draft(path, text)
 
+
+def _parse_draft(path: Path, text: str) -> DraftFile:
+    """Parse draft JSONL text. Total: see :func:`read_draft`."""
     entries: list[dict] = []
     problems: list[Problem] = []
     lines = 0
@@ -713,6 +754,78 @@ def new_entry(citation: str = "", kind: str = "prose") -> dict:
     }
 
 
+class StatusRefused(ValueError):
+    """A bulk status change that was refused as a whole. ``reasons`` per row."""
+
+    def __init__(self, reasons: list[tuple[str, str]]):
+        self.reasons = reasons
+        super().__init__(
+            "nothing changed: " + "; ".join(f"{rid}: {why}" for rid, why in reasons)
+        )
+
+
+def set_status(
+    title: int,
+    draft_ids: Iterable[str],
+    status: str,
+    *,
+    eval_dir: Path | str = DEFAULT_EVAL_DIR,
+    db_path: Path | str = DEFAULT_DB,
+) -> list[str]:
+    """Set ``status`` on several draft rows in one write. Returns the ids changed.
+
+    All-or-nothing, like promotion: if any selected row cannot take the status
+    — an unknown id, an empty question, a citation the index does not have —
+    :class:`StatusRefused` lists every reason and the file is not touched.
+    Only ``status`` is edited. Like saving a single row, the write also
+    persists the in-memory repairs and derived ids from reading the file.
+
+    This is still only the draft. Nothing reaches gold.jsonl until Approve &
+    merge validates it.
+    """
+    if status not in goldset.STATUSES:
+        raise StatusRefused([("*", f"status must be one of {goldset.STATUSES}")])
+    wanted = list(dict.fromkeys(str(i) for i in draft_ids))
+    if not wanted:
+        raise StatusRefused([("*", "no rows were selected")])
+
+    with _DRAFT_LOCK:
+        draft = read_draft(title, eval_dir)
+        if draft.skipped:
+            raise StatusRefused([(
+                "*",
+                f"{draft.skipped} line(s) of {draft.path.name} cannot be read; saving would "
+                f"delete them — fix them by hand first",
+            )])
+        by_id = {e["draft_id"]: e for e in draft.entries}
+        indexed = goldset.index_sections(Path(db_path)) if status == "approved" else set()
+
+        reasons: list[tuple[str, str]] = []
+        for rid in wanted:
+            entry = by_id.get(rid)
+            if entry is None:
+                reasons.append((rid, "no such draft entry"))
+            elif status == "approved":
+                if not str(entry.get("question", "")).strip():
+                    reasons.append((rid, "no question has been written yet"))
+                if entry.get("kind") not in goldset.KINDS:
+                    reasons.append((rid, f"kind {entry.get('kind')!r} is not one of "
+                                         f"{goldset.KINDS}"))
+                missing = [c for c in entry.get("relevant_citations") or [] if c not in indexed]
+                if missing:
+                    reasons.append((rid, f"{', '.join(missing)} is not in the index, so the "
+                                         f"overlap meter could not check this question"))
+        if reasons:
+            raise StatusRefused(reasons)
+
+        changed = [rid for rid in wanted if by_id[rid].get("status") != status]
+        for rid in changed:
+            by_id[rid]["status"] = status
+        if changed:
+            save_draft(title, draft.entries, eval_dir)
+        return changed
+
+
 # --- promotion --------------------------------------------------------------
 
 
@@ -757,6 +870,30 @@ def for_gold(entry: dict) -> dict:
     return clean
 
 
+def _gold_form(row: dict) -> dict:
+    """A gold row in the shape :func:`for_gold` produces, for comparison.
+
+    Keeps the row's real status: a gold entry parked as ``draft`` is not the
+    same thing as an approved draft entry with the same question.
+    """
+    clean = for_gold(row)
+    clean["status"] = row.get("status", "approved")
+    return clean
+
+
+def _differing_fields(candidate: dict, gold_row: dict) -> tuple[str, ...]:
+    """Fields that differ. An absent field and an empty one are the same:
+    reading a draft fills in ``notes: ""``, which is not a change of content."""
+    ours, theirs = candidate, _gold_form(gold_row)
+
+    def value(d: dict, k: str):
+        v = d.get(k)
+        return None if v in ("", None) else v
+
+    keys = ours.keys() | theirs.keys()
+    return tuple(sorted(k for k in keys if value(ours, k) != value(theirs, k)))
+
+
 @dataclass(frozen=True)
 class Promotion:
     """What ``promote`` did, or refused to do and why."""
@@ -769,18 +906,29 @@ class Promotion:
     warnings: tuple[Problem, ...] = ()
     pre_existing: tuple[Problem, ...] = ()
     bad_citations: tuple[tuple[str, str], ...] = ()  # (question, citation)
+    # (question, fields that differ from the gold row with the same question)
+    conflicts: tuple[tuple[str, tuple[str, ...]], ...] = ()
     gold_before: int = 0
     gold_after: int = 0
     staleness: tuple[str, ...] = ()
 
     @property
     def summary(self) -> str:
+        if self.ok and not self.promoted:
+            return (
+                f"nothing new to merge; retired {len(self.already_present)} draft entry(s) "
+                f"already in the gold set, identical field for field"
+            )
         if self.ok:
             return (
                 f"promoted {len(self.promoted)} question(s); "
                 f"gold set {self.gold_before} → {self.gold_after}"
             )
         return f"nothing written: {len(self.errors)} error(s)"
+
+
+def _refuse(check: str, message: str, **kw) -> Promotion:
+    return Promotion(ok=False, errors=(Problem(check, "error", message),), **kw)
 
 
 def promote(
@@ -793,52 +941,108 @@ def promote(
 ) -> Promotion:
     """Validate the approved drafts for one title and merge them into gold.jsonl.
 
-    All-or-nothing: if any new entry fails validation, nothing is written.
-    Half a promotion would leave the gold set in a state no one chose.
+    All-or-nothing, across **both** files: either gold.jsonl gains the
+    approved entries *and* the draft loses them, or neither file changes.
+
+    The draft is the only copy of unmerged work, so it is the file that must
+    never be rewritten on a guess. Three rules follow:
+
+    * A draft row is retired only when gold.jsonl, as verified on disk, holds
+      it field for field — appended by this call, or already there identical
+      (the re-run after a crash between the two writes). A row whose question
+      is already in gold but whose citations, kind or notes differ is a
+      *conflict*: promotion refuses rather than silently keeping one version.
+    * Gold is written first, then read back and compared. Only then is the
+      draft rewritten — and only if its bytes are still exactly what was read.
+    * Any failure after gold was written restores gold.jsonl to its original
+      bytes, so a failed promotion leaves both files as they were.
 
     Pre-existing problems in gold.jsonl are reported but do not block. A stale
     negative someone else left behind must not make the file unappendable
     forever — the gate's job is to stop *new* breakage getting in.
     """
     gold_path = Path(gold_path)
-    with gold_lock(gold_path):
+    dpath = draft_path(title, eval_dir)
+    with gold_lock(gold_path), _DRAFT_LOCK:
         sections = goldset.index_sections(Path(db_path))
         if not sections:
-            return Promotion(
-                ok=False,
-                errors=(
-                    Problem(
-                        "authoring:no-index",
-                        "error",
-                        f"no indexed sections in {db_path} — a citation cannot be verified "
-                        f"against an index that is not built, and an unverified citation is "
-                        f"a question that can never be answered correctly",
-                    ),
-                ),
+            return _refuse(
+                "authoring:no-index",
+                f"no indexed sections in {db_path} — a citation cannot be verified "
+                f"against an index that is not built, and an unverified citation is "
+                f"a question that can never be answered correctly",
             )
 
-        draft = load_draft(title, eval_dir)
+        # Parse exactly the bytes we will later check, so "unchanged since we
+        # read it" means what it says.
+        try:
+            draft_original = _snapshot(dpath)
+        except OSError as exc:
+            return _refuse("authoring:draft-unreadable", f"cannot read {dpath}: {exc}")
+        draft_file = _parse_draft(dpath, (draft_original or b"").decode("utf-8", "replace"))
+        if draft_file.skipped:
+            # Rewriting the draft would drop these lines for good.
+            unreadable = [str(p) for p in draft_file.problems
+                          if p.check in ("draft:bad-json", "draft:not-an-object")]
+            return _refuse(
+                "authoring:draft-unreadable-lines",
+                f"{draft_file.skipped} line(s) of {dpath.name} could not be read "
+                f"({'; '.join(unreadable)}). Promotion rewrites the draft, which would "
+                f"delete them — fix them by hand first",
+            )
+        draft = draft_file.entries
+
         approved = [e for e in draft if e.get("status") == "approved"]
         still_draft = len(draft) - len(approved)
         if not approved:
-            return Promotion(
-                ok=False,
+            return _refuse(
+                "authoring:nothing-approved",
+                f"no entry in the Title {title} draft is marked approved "
+                f"({still_draft} still in draft)",
                 still_draft=still_draft,
-                errors=(
-                    Problem(
-                        "authoring:nothing-approved",
-                        "error",
-                        f"no entry in the Title {title} draft is marked approved "
-                        f"({still_draft} still in draft)",
-                    ),
-                ),
             )
 
-        gold = goldset.load(gold_path)
-        existing = {str(e.get("question", "")).strip() for e in gold}
+        try:
+            gold_original = _snapshot(gold_path)
+            gold = goldset.load(gold_path)
+        except (OSError, ValueError) as exc:
+            return _refuse("authoring:gold-unreadable", f"cannot read {gold_path}: {exc}",
+                           still_draft=still_draft)
+        if _snapshot(gold_path) != gold_original:  # pragma: no cover - lockless writer
+            return _refuse("authoring:gold-changed",
+                           f"{gold_path} changed while it was being read — try again",
+                           still_draft=still_draft)
+
+        by_question: dict[str, dict] = {}
+        for row in gold:
+            by_question.setdefault(str(row.get("question", "")).strip(), row)
+
         candidates = [for_gold(e) for e in approved]
-        already = tuple(c for c in candidates if c["question"] in existing)
-        incoming = [c for c in candidates if c["question"] not in existing]
+        already, conflicts, incoming = [], [], []
+        for c in candidates:
+            row = by_question.get(c["question"])
+            if row is None:
+                incoming.append(c)
+            elif differing := _differing_fields(c, row):
+                conflicts.append((c["question"], differing))
+            else:
+                already.append(c)
+
+        if conflicts:
+            return Promotion(
+                ok=False,
+                errors=(Problem(
+                    "authoring:conflicts-with-gold", "error",
+                    f"{len(conflicts)} approved draft entry(s) ask a question that is already "
+                    f"in {gold_path.name} but differ from it. Retiring them would discard "
+                    f"the draft's version; appending them would duplicate the question. "
+                    f"Make the draft match gold, or delete those draft rows",
+                ),),
+                conflicts=tuple(conflicts),
+                still_draft=still_draft,
+                gold_before=len(gold),
+                gold_after=len(gold),
+            )
 
         # Requirement 2b, stated per entry so the UI can mark the offending
         # row rather than printing a wall of text.
@@ -869,21 +1073,27 @@ def promote(
                 gold_after=len(gold),
             )
 
-        if incoming:
-            _atomic_write(gold_path, _as_jsonl(merged))
-
-        # Gold is durable now. Clearing the draft is a second write that
-        # cannot share its atomicity, so promotion is written to be
-        # re-runnable: anything already in gold is recognised next time and
-        # retired from the draft rather than appended twice.
-        promoted_ids = {e.get("draft_id") for e in approved}
-        remaining = [e for e in draft if e.get("draft_id") not in promoted_ids]
-        save_draft(title, remaining, eval_dir)
+        promoted_ids = {e["draft_id"] for e in approved}
+        remaining = [e for e in draft if e["draft_id"] not in promoted_ids]
+        failure = _commit(
+            gold_path, gold_original, merged if incoming else None,
+            dpath, draft_original, remaining,
+        )
+        if failure is not None:
+            return Promotion(
+                ok=False,
+                errors=(failure,),
+                warnings=warnings,
+                pre_existing=pre_existing,
+                still_draft=still_draft,
+                gold_before=len(gold),
+                gold_after=len(gold),
+            )
 
         return Promotion(
             ok=True,
             promoted=tuple(incoming),
-            already_present=already,
+            already_present=tuple(already),
             still_draft=still_draft,
             warnings=warnings,
             pre_existing=pre_existing,
@@ -891,6 +1101,60 @@ def promote(
             gold_after=len(merged),
             staleness=tuple(_staleness_after(specs, merged)),
         )
+
+
+class _DraftChanged(Exception):
+    pass
+
+
+def _commit(
+    gold_path: Path,
+    gold_original: bytes | None,
+    merged: list[dict] | None,
+    dpath: Path,
+    draft_original: bytes | None,
+    remaining: list[dict],
+) -> Problem | None:
+    """Write gold (if ``merged``), verify it, then the draft; undo gold on any failure.
+
+    Returns ``None`` on success, else the error to report. On every error path
+    the draft is untouched, and gold is restored to ``gold_original`` unless the
+    restore itself fails — which is reported, and is still safe: the draft keeps
+    its approved rows, and re-running finds them in gold identical and retires
+    them instead of appending them twice.
+    """
+
+    def rolled_back(what: str, exc: BaseException) -> Problem:
+        try:
+            _restore(gold_path, gold_original)
+            undo = f"{gold_path.name} has been restored to exactly what it was"
+        except OSError as restore_exc:
+            logger.error("promotion rollback failed: %s", restore_exc)
+            undo = (
+                f"restoring {gold_path.name} ALSO failed ({restore_exc}), so it now holds "
+                f"the merged entries while the draft still holds them as approved. Nothing "
+                f"is lost: run Approve & merge again and it will retire the duplicates"
+            )
+        return Problem(
+            "authoring:write-failed", "error",
+            f"{what}: {exc}. The draft was not modified, and {undo}",
+        )
+
+    if merged is not None:
+        try:
+            _atomic_write(gold_path, _as_jsonl(merged))
+            if goldset.load(gold_path) != merged:
+                raise OSError(f"{gold_path.name} did not read back as written")
+        except (OSError, ValueError) as exc:
+            return rolled_back(f"writing {gold_path.name} failed", exc)
+
+    try:
+        if _snapshot(dpath) != draft_original:
+            raise _DraftChanged(f"{dpath.name} was edited while the merge was running")
+        _atomic_write(dpath, _as_jsonl(remaining))
+    except (OSError, _DraftChanged) as exc:
+        return rolled_back(f"updating {dpath.name} failed", exc)
+    return None
 
 
 def _staleness_after(specs: list[TitleSpec], merged: list[dict]) -> list[str]:

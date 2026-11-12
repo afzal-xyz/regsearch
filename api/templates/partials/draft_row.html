@@ -13,6 +13,10 @@
   {# ---- what the author sees by default: citation, heading, breadcrumb ---- #}
   <div class="draft-head">
     <div>
+      <input type="checkbox" name="draft_id" value="{{ id }}" form="bulk"
+             aria-label="select this row"
+             data-approvable="{{ '1' if item.approvable and item.ready
+                                 and entry.status != 'approved' else '0' }}">
       {% if item.is_negative %}
         <span class="pill">negative — no correct section</span>
       {% else %}
@@ -104,3 +108,4 @@
     </div>
   </form>
 </div>
+{% if oob %}{% include "partials/promote_controls.html" %}{% endif %}
